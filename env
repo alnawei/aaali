@@ -1,0 +1,36 @@
+# ================= 核心鉴权 =================
+BOT_TOKEN=YOUR_TG_BOT_TOKEN
+ADMIN_ID=123456789
+
+# ================= SMTP 发信配置 =================
+SMTP_SERVER=smtp-mail.outlook.com
+SMTP_PORT=587
+SENDER_EMAIL=tek****@outlook.com
+SENDER_PASSWORD=your_outlook_app_password
+RECIPIENT=tek****@outlook.com
+
+# ================= 阿里云启动模板 (TPL_REGION_ID) =================
+# 🇭🇰 中国香港
+TPL_CN_HONGKONG=lt-hongkong123456789
+
+# 🌏 亚洲地区 (按需取消注释并配置)
+# TPL_AP_NORTHEAST_1=      # 日本（东京）
+# TPL_AP_NORTHEAST_2=      # 韩国（首尔）
+# TPL_AP_SOUTHEAST_1=      # 新加坡
+# TPL_AP_SOUTHEAST_3=      # 马来西亚（吉隆坡）
+# TPL_AP_SOUTHEAST_5=      # 印度尼西亚（雅加达）
+# TPL_AP_SOUTHEAST_6=      # 菲律宾（马尼拉）
+# TPL_AP_SOUTHEAST_7=      # 泰国（曼谷）
+# TPL_AP_SOUTHEAST_8=      # 马来西亚（柔佛州）
+
+# 🌍 欧美地区
+# TPL_US_EAST_1=           # 美国（弗吉尼亚）
+# TPL_US_WEST_1=           # 美国（硅谷）
+# TPL_NA_SOUTH_1=          # 墨西哥
+# TPL_EU_WEST_1=           # 英国（伦敦）
+# TPL_EU_WEST_2=           # 法国（巴黎）
+# TPL_EU_CENTRAL_1=        # 德国（法兰克福）
+
+# 🐪 中东及其他
+# TPL_ME_EAST_1=           # 阿联酋（迪拜）
+# TPL_ME_CENTRAL_1=        # 沙特（利雅得）

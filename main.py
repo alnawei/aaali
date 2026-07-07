@@ -13,6 +13,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import json
+# 阿里云 SDK 依赖
+from alibabacloud_ecs20140526.client import Client as EcsClient
+from alibabacloud_tea_openapi import models as open_api_models
+from alibabacloud_ecs20140526 import models as ecs_models
+
 # ================= 1. 环境与基础设置 =================
 # 加载 .env 文件
 load_dotenv()
@@ -27,6 +33,9 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
 RECIPIENT = os.getenv("RECIPIENT")
+
+ALIYUN_ACCESS_KEY_ID = os.getenv("ALIYUN_ACCESS_KEY_ID")
+ALIYUN_ACCESS_KEY_SECRET = os.getenv("ALIYUN_ACCESS_KEY_SECRET")
 
 # 初始化 Bot 和 Dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -96,61 +105,144 @@ async def show_server_management(message: types.Message):
     
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-# ================= 4. 邮箱验证流 =================
+# ================= 4. 邮箱验证流与自动开机逻辑 =================
+
+def get_template_id(region_id: str) -> str:
+    """根据 region_id 动态读取 .env 中的启动模板 ID"""
+    env_var_name = f"TPL_{region_id.replace('-', '_').upper()}"
+    return os.getenv(env_var_name, "").strip()
+
+def create_ecs_instance_sync(region_id: str, template_id: str) -> dict:
+    """同步调用阿里云 API 创建实例并轮询获取 IP (后台线程执行)"""
+    try:
+        # 1. 初始化客户端
+        config = open_api_models.Config(
+            access_key_id=ALIYUN_ACCESS_KEY_ID,
+            access_key_secret=ALIYUN_ACCESS_KEY_SECRET,
+            endpoint=f'ecs.{region_id}.aliyuncs.com'
+        )
+        client = EcsClient(config)
+
+        # 2. 发起 RunInstances 创建请求
+        run_request = ecs_models.RunInstancesRequest(
+            region_id=region_id,
+            launch_template_id=template_id,
+            amount=1
+        )
+        run_response = client.run_instances(run_request)
+        instance_id = run_response.body.instance_id_sets.instance_id_set[0]
+        
+        # 3. 轮询 DescribeInstances 等待机器 Running 并获取公网 IP
+        describe_request = ecs_models.DescribeInstancesRequest(
+            region_id=region_id,
+            instance_ids=json.dumps([instance_id])
+        )
+        
+        # 最多轮询 15 次，每次间隔 5 秒 (约 75 秒超时)
+        for _ in range(15):
+            time.sleep(5)
+            desc_resp = client.describe_instances(describe_request)
+            instances = desc_resp.body.instances.instance
+            if not instances:
+                continue
+                
+            instance = instances[0]
+            status = instance.status
+            
+            if status == "Running":
+                # 提取公网 IP
+                public_ip = "无公网IP"
+                if instance.public_ip_address and instance.public_ip_address.ip_address:
+                    public_ip = instance.public_ip_address.ip_address[0]
+                
+                return {"success": True, "instance_id": instance_id, "ip": public_ip}
+            
+            elif status in ["Stopped", "Deleted"]:
+                return {"success": False, "error": f"实例状态异常: {status}"}
+                
+        return {"success": False, "error": "轮询超时，机器可能还在创建中，请稍后去控制台查看。"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ----------------- 下面是原有的 TG 回调处理 -----------------
+
 @dp.callback_query(F.data == "action_add_server")
 async def trigger_add_server(callback: types.CallbackQuery, state: FSMContext):
     """处理【新增服务器】点击事件"""
-    if callback.from_user.id != ADMIN_ID: 
-        return await callback.answer()
+    if callback.from_user.id != ADMIN_ID: return await callback.answer()
 
     verify_code = f"{random.randint(0, 999999):06d}"
     await callback.message.answer("⏳ 正在向绑定邮箱发送验证码，请稍候...")
-    
-    # 异步抛出邮件发送任务
     send_success = await asyncio.to_thread(send_email_sync, verify_code)
 
     if send_success:
-        # 记录验证码和当前时间戳到 FSM 内存中
         await state.update_data(code=verify_code, timestamp=time.time())
         await state.set_state(ServerManagement.waiting_for_code)
         await callback.message.answer("✅ 验证码已发送至绑定邮箱！\n请直接在此回复 `6位数字验证码`。")
     else:
         await callback.message.answer("❌ 验证码发送失败，请检查 SMTP 或网络配置。")
-    
     await callback.answer()
 
 @dp.message(ServerManagement.waiting_for_code)
 async def verify_code_input(message: types.Message, state: FSMContext):
     """处理用户输入的验证码"""
-    if message.from_user.id != ADMIN_ID:
-        return
+    if message.from_user.id != ADMIN_ID: return
     
     user_input_code = message.text.strip()
     user_data = await state.get_data()
     
-    # 校验：是否超时 (300秒)
     if time.time() - user_data.get("timestamp", 0) > 300:
         await state.clear()
         return await message.answer("⚠️ 验证码已过期，请重新进入【💻 服务器管理】点击新增。")
 
-    # 校验：验证码是否匹配
     if user_input_code == user_data.get("code"):
-        # 验证成功，渲染地域选择一级菜单
         builder = InlineKeyboardBuilder()
-        
-        # 第一行：直达香港
         builder.row(InlineKeyboardButton(text="🇭🇰 中国香港", callback_data="region_cn-hongkong"))
-        # 第二行：大区折叠菜单
         builder.row(
-            InlineKeyboardButton(text="🌏 亚洲地区", callback_data="menu_asia"),
-            InlineKeyboardButton(text="🌍 欧美地区", callback_data="menu_eu_us"),
-            InlineKeyboardButton(text="🐪 中东及其他", callback_data="menu_others")
+            # 演示：亚洲菜单暂不展开，直接放两个直达做测试
+            InlineKeyboardButton(text="🇯🇵 日本(东京)", callback_data="region_ap-northeast-1"),
+            InlineKeyboardButton(text="🇰🇷 韩国(首尔)", callback_data="region_ap-northeast-2")
         )
-        
-        await message.answer("✅ 安全验证通过！\n请选择你要开通的服务器地区：", reply_markup=builder.as_markup())
+        await message.answer("✅ 验证通过！请选择开服地区：", reply_markup=builder.as_markup())
         await state.set_state(ServerManagement.waiting_for_region)
     else:
-        await message.answer("❌ 验证码错误，请检查后重新输入。")
+        await message.answer("❌ 验证码错误，请重试。")
+
+@dp.callback_query(ServerManagement.waiting_for_region, F.data.startswith("region_"))
+async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext):
+    """【核心】接收地区选择，执行开机"""
+    if callback.from_user.id != ADMIN_ID: return await callback.answer()
+    
+    region_id = callback.data.replace("region_", "")
+    template_id = get_template_id(region_id)
+    
+    if not template_id:
+        return await callback.message.edit_text(f"⚠️ 暂未在 `.env` 中配置 `{region_id}` 对应的启动模板 (TPL_xxx)，请配置后重启 Bot。")
+    
+    # 清理状态机，防止重复点击
+    await state.clear()
+    
+    # 发送过渡动画/提示
+    progress_msg = await callback.message.edit_text(f"🚀 已拦截指令。正在向阿里云 `{region_id}` 下发创建任务，请耐心等待 (约需20-40秒)...")
+    
+    # 异步抛出阿里云 SDK 调用，防止阻塞 Bot
+    result = await asyncio.to_thread(create_ecs_instance_sync, region_id, template_id)
+    
+    if result["success"]:
+        text = (
+            f"🎉 **MG 控制台扩容成功！**\n\n"
+            f"🌍 **地域**: `{region_id}`\n"
+            f"🆔 **实例 ID**: `{result['instance_id']}`\n"
+            f"🌐 **公网 IP**: `{result['ip']}`\n"
+            f"✅ **状态**: 运行中\n\n"
+            f"安全组与计费模式已按模板自动下发。"
+        )
+        await progress_msg.edit_text(text, parse_mode="Markdown")
+    else:
+        await progress_msg.edit_text(f"❌ **创建失败**\n\n原因: {result.get('error')}", parse_mode="Markdown")
+
+    await callback.answer()
 
 # 启动入口
 async def main():

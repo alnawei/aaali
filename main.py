@@ -18,6 +18,7 @@ import json
 from alibabacloud_ecs20140526.client import Client as EcsClient
 from alibabacloud_tea_openapi import models as open_api_models
 from alibabacloud_ecs20140526 import models as ecs_models
+from aiogram.filters import CommandStart # <--- 加上这一行
 
 # ================= 1. 环境与基础设置 =================
 # 加载 .env 文件
@@ -320,16 +321,10 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
 
     await callback.answer()
 
-# 启动入口
+# ================= 启动入口 =================
 async def main():
-    # 兼容 aiogram 3.x 特性
-    from aiogram.filters import CommandStart
-    # 注册 CommandStart 到全局以供使用
-    global CommandStart
-    
-    print("MG 控制台 V2.0 机器人已启动...")
+    print("🚀 MG 控制台 V2.0 机器人已启动...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    from aiogram.filters import CommandStart
     asyncio.run(main())

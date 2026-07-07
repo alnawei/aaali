@@ -184,6 +184,70 @@ async def trigger_add_server(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ 验证码发送失败，请检查 SMTP 或网络配置。")
     await callback.answer()
 
+# ================= 动态折叠菜单 UI 构建器 =================
+def get_region_main_menu():
+    """生成一级地区菜单"""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🇭🇰 中国香港", callback_data="region_cn-hongkong"))
+    builder.row(
+        InlineKeyboardButton(text="🌏 亚洲地区", callback_data="menu_asia"),
+        InlineKeyboardButton(text="🌍 欧美地区", callback_data="menu_eu_us")
+    )
+    builder.row(InlineKeyboardButton(text="🐪 中东及其他", callback_data="menu_others"))
+    return builder.as_markup()
+
+def get_region_asia_menu():
+    """生成亚洲地区菜单"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🇯🇵 日本(东京)", callback_data="region_ap-northeast-1"),
+        InlineKeyboardButton(text="🇰🇷 韩国(首尔)", callback_data="region_ap-northeast-2")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇸🇬 新加坡", callback_data="region_ap-southeast-1"),
+        InlineKeyboardButton(text="🇲🇾 马来西亚(吉隆坡)", callback_data="region_ap-southeast-3")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇮🇩 印尼(雅加达)", callback_data="region_ap-southeast-5"),
+        InlineKeyboardButton(text="🇵🇭 菲律宾(马尼拉)", callback_data="region_ap-southeast-6")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇹🇭 泰国(曼谷)", callback_data="region_ap-southeast-7"),
+        InlineKeyboardButton(text="🇲🇾 马来西亚(柔佛)", callback_data="region_ap-southeast-8")
+    )
+    builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="menu_main"))
+    return builder.as_markup()
+
+def get_region_eu_us_menu():
+    """生成欧美地区菜单"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🇺🇸 美国(弗吉尼亚)", callback_data="region_us-east-1"),
+        InlineKeyboardButton(text="🇺🇸 美国(硅谷)", callback_data="region_us-west-1")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇲🇽 墨西哥", callback_data="region_na-south-1"),
+        InlineKeyboardButton(text="🇬🇧 英国(伦敦)", callback_data="region_eu-west-1")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇫🇷 法国(巴黎)", callback_data="region_eu-west-2"),
+        InlineKeyboardButton(text="🇩🇪 德国(法兰克福)", callback_data="region_eu-central-1")
+    )
+    builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="menu_main"))
+    return builder.as_markup()
+
+def get_region_others_menu():
+    """生成中东及其他地区菜单"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🇦🇪 阿联酋(迪拜)", callback_data="region_me-east-1"),
+        InlineKeyboardButton(text="🇸🇦 沙特(利雅得)", callback_data="region_me-central-1")
+    )
+    builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="menu_main"))
+    return builder.as_markup()
+
+# ================= 验证码校验与菜单导航逻辑 =================
+
 @dp.message(ServerManagement.waiting_for_code)
 async def verify_code_input(message: types.Message, state: FSMContext):
     """处理用户输入的验证码"""
@@ -197,17 +261,29 @@ async def verify_code_input(message: types.Message, state: FSMContext):
         return await message.answer("⚠️ 验证码已过期，请重新进入【💻 服务器管理】点击新增。")
 
     if user_input_code == user_data.get("code"):
-        builder = InlineKeyboardBuilder()
-        builder.row(InlineKeyboardButton(text="🇭🇰 中国香港", callback_data="region_cn-hongkong"))
-        builder.row(
-            # 演示：亚洲菜单暂不展开，直接放两个直达做测试
-            InlineKeyboardButton(text="🇯🇵 日本(东京)", callback_data="region_ap-northeast-1"),
-            InlineKeyboardButton(text="🇰🇷 韩国(首尔)", callback_data="region_ap-northeast-2")
-        )
-        await message.answer("✅ 验证通过！请选择开服地区：", reply_markup=builder.as_markup())
+        await message.answer("✅ 验证通过！请选择开服地区：", reply_markup=get_region_main_menu())
         await state.set_state(ServerManagement.waiting_for_region)
     else:
         await message.answer("❌ 验证码错误，请重试。")
+
+# --- 菜单导航回调拦截 ---
+@dp.callback_query(ServerManagement.waiting_for_region, F.data.startswith("menu_"))
+async def navigate_menus(callback: types.CallbackQuery):
+    """处理二级菜单的切换"""
+    if callback.from_user.id != ADMIN_ID: return await callback.answer()
+    
+    target_menu = callback.data
+    
+    if target_menu == "menu_main":
+        await callback.message.edit_reply_markup(reply_markup=get_region_main_menu())
+    elif target_menu == "menu_asia":
+        await callback.message.edit_reply_markup(reply_markup=get_region_asia_menu())
+    elif target_menu == "menu_eu_us":
+        await callback.message.edit_reply_markup(reply_markup=get_region_eu_us_menu())
+    elif target_menu == "menu_others":
+        await callback.message.edit_reply_markup(reply_markup=get_region_others_menu())
+        
+    await callback.answer()
 
 @dp.callback_query(ServerManagement.waiting_for_region, F.data.startswith("region_"))
 async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext):

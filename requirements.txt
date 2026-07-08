@@ -1,0 +1,7 @@
+aiogram
+python-dotenv
+alibabacloud_ecs20140526
+resend
+python-dateutil
+alibabacloud_cms20190101
+apscheduler

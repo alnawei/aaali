@@ -254,10 +254,15 @@ async def cmd_server_management(message: types.Message, state: FSMContext):
     await wait_msg.delete()
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
+# =====================================================================
+# ================= 🚀 新增服务器 (邮箱验证 + 调用启动模板) =================
+# =====================================================================
+
 @router.callback_query(F.data == "action_add_server")
 async def trigger_add_server(callback: types.CallbackQuery, state: FSMContext):
     """处理【新增服务器】点击事件"""
-    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
+    if callback.from_user.id != config.ADMIN_ID: 
+        return await callback.answer("权限不足！", show_alert=True)
 
     verify_code = f"{random.randint(0, 999999):06d}"
     await callback.message.answer("⏳ 正在向绑定邮箱发送验证码，请稍候...")
@@ -272,8 +277,8 @@ async def trigger_add_server(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @router.message(ServerManagement.waiting_for_code)
-async def verify_code_input(message: types.Message, state: FSMContext):
-    """处理用户输入的验证码"""
+async def verify_add_server_code(message: types.Message, state: FSMContext):
+    """处理用户输入的验证码，并展示云端启动模板"""
     if message.from_user.id != config.ADMIN_ID: return
     
     user_input_code = message.text.strip()
@@ -284,10 +289,15 @@ async def verify_code_input(message: types.Message, state: FSMContext):
         return await message.answer("⚠️ 验证码已过期，请重新进入【💻 服务器管理】点击新增。")
 
     if user_input_code == user_data.get("code"):
-        await message.answer("✅ 验证通过！请选择开服地区：", reply_markup=get_region_main_menu())
-        await state.set_state(ServerManagement.waiting_for_region)
-    else:
-        await message.answer("❌ 验证码错误，请重试。")
+        # 验证成功！清除状态机
+        await state.clear()
+        
+        # 接入数据库模板逻辑
+        import db
+        templates = db.get_all_templates()
+        
+        if not templates:
+            return await message
 
 @router.callback_query(ServerManagement.waiting_for_region, F.data.startswith("menu_"))
 async def navigate_menus(callback: types.CallbackQuery):

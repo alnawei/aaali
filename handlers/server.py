@@ -258,7 +258,7 @@ async def cmd_server_management(message: types.Message, state: FSMContext):
 # ================= 🚀 新增服务器 (邮箱验证 + 调用启动模板) =================
 # =====================================================================
 
-@router.callback_query(F.data == "action_add_server")
+@router.callback_query(F.data == "add_server")
 async def trigger_add_server(callback: types.CallbackQuery, state: FSMContext):
     """处理【新增服务器】点击事件"""
     if callback.from_user.id != config.ADMIN_ID: 

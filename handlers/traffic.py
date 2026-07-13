@@ -3,6 +3,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import sqlite3
 import db
 from datetime import datetime
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 router = Router()
 

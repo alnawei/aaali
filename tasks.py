@@ -2,6 +2,7 @@ import asyncio
 import db
 import config
 from aiogram import Bot
+from datetime import datetime
 from alibabacloud_ecs20140526.client import Client as EcsClient
 from alibabacloud_ecs20140526 import models as ecs_models
 from alibabacloud_tea_openapi import models as open_api_models
@@ -94,3 +95,47 @@ async def traffic_monitor_job(bot: Bot, admin_id: int):
         # 🟢 【绿灯恢复】：如果有人调高了流量包或重置了流量，比例降下来了
         elif usage_percent < 0.80:
             alerted_80_instances.discard(instance_id) # 解除它的警告标记
+
+async def daily_billing_check_job(bot: Bot, admin_id: int):
+    """每日后台巡查任务：主动推送即将到期的机器，提醒老板催费"""
+    import sqlite3
+    import db
+    
+    conn = sqlite3.connect(db.DB_PATH)
+    cursor = conn.cursor()
+    # 只需要拿实例 ID 和 到期时间
+    cursor.execute("SELECT instance_id, expire_time FROM ecs_business")
+    rows = cursor.fetchall()
+    conn.close()
+
+    now = datetime.now()
+    alerts = []
+
+    for row in rows:
+        instance_id = row[0]
+        expire_time_str = row[1]
+        
+        if not expire_time_str:
+            continue
+
+        try:
+            expire_date = datetime.strptime(expire_time_str, "%Y-%m-%d")
+            days_left = (expire_date - now).days
+
+            short_id = instance_id[-6:]
+
+            # 💡 精准推送逻辑：只有在剩余3天、1天 和 今天到期时，才发通知。
+            # 这样既能起到提醒作用，又不会每天无脑轰炸你。
+            if days_left in [3, 1]:
+                alerts.append(f"• `...{short_id}` 剩余 **{days_left}** 天 (到期: `{expire_time_str}`)")
+            elif days_left == 0:
+                alerts.append(f"• `...{short_id}` 🚨 **今日到期！请立即处理！**")
+            elif days_left == -1:
+                alerts.append(f"• `...{short_id}` ❌ **已过期 1 天，请确认是否拔管释放**")
+        except ValueError:
+            pass
+
+    # 如果今天有需要催费的机器，就给老板发微信（TG）
+    if alerts:
+        msg = "🔔 **【每日催费与到期预警】**\n\n老板，以下机器即将到期，请及时联系客户续费：\n\n" + "\n".join(alerts)
+        await bot.send_message(chat_id=admin_id, text=msg, parse_mode="Markdown")

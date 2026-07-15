@@ -1,9 +1,110 @@
-from aiogram import Router, types, F
-import config
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
+from db import get_active_servers  # 导入你的真实查询函数
 
 router = Router()
 
+# ================= 🌍 地域名称映射字典 =================
+REGION_MAP = {
+    "cn-hongkong": "香港",
+    "ap-northeast-1": "东京",
+    "ap-southeast-1": "新加坡",
+    "us-west-1": "硅谷",
+    "cn-shanghai": "上海",
+}
+
+# ================= 🛠️ 工具函数与数据获取 =================
+def get_servers_data(user_id: int):
+    """统一获取服务器列表数据 (支持真实查询与假数据回退)"""
+    try:
+        servers = get_active_servers(user_id)
+    except Exception:
+        servers = []
+
+    if not servers:
+        servers = [
+            {"instance_id": "i-testVirtualServerHK001", "name": "虚拟测试节点-香港", "region": "cn-hongkong", "ip": "47.242.11.22"},
+            {"instance_id": "i-testVirtualServerJP002", "name": "虚拟测试节点-东京", "region": "ap-northeast-1", "ip": "8.213.33.44"}
+        ]
+    return servers
+
+def build_servers_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """构建第一步的服务器键盘 (显示 IP)"""
+    servers = get_servers_data(user_id)
+    builder = []
+    
+    for srv in servers:
+        cb_data = f"srv_sel:{srv['instance_id']}"
+        ip_display = srv.get("ip", "未知IP")
+        builder.append([InlineKeyboardButton(text=f"🖥 {ip_display}", callback_data=cb_data)])
+    
+    return InlineKeyboardMarkup(inline_keyboard=builder)
+
+
+# ================= 🚀 第一步：接收主菜单点击 =================
 @router.message(F.text == "⚙️ 节点配置")
-async def show_node_settings(message: types.Message):
-    if message.from_user.id != config.ADMIN_ID: return
-    await message.answer("🚧 **节点配置模块**正在开发中...\n敬请期待下一阶段更新！", parse_mode="Markdown")
+async def show_node_list(message: Message):
+    keyboard = build_servers_keyboard(message.from_user.id)
+    
+    await message.answer(
+        "⚙️ **节点配置中心 (第一步)**\n\n请在下方悬浮菜单中选择你要操作的服务器：",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+# ================= 🚀 第二步：选中服务器，展示文本与脚本清单 =================
+@router.callback_query(F.data.startswith("srv_sel:"))
+async def show_script_options(call: CallbackQuery):
+    _, instance_id = call.data.split(":")
+    
+    servers = get_servers_data(call.from_user.id)
+    srv = next((s for s in servers if s["instance_id"] == instance_id), None)
+    
+    if not srv:
+        await call.answer("获取服务器信息失败，请重试", show_alert=True)
+        return
+        
+    region_id = srv.get("region", "未知地域")
+    region_name = REGION_MAP.get(region_id, region_id)
+    public_ip = srv.get("ip", "未知IP")
+    
+    available_scripts = [
+        {"id": "bbr", "name": "🟢 bbr加速"},
+        {"id": "xui", "name": "🔴 x-ui面板"},
+        {"id": "mgui", "name": "🔴 MG 私有面板"},
+        {"id": "toolbox", "name": "🔴 运维工具箱 (快捷键 k)"},
+    ]
+    
+    builder = []
+    for script in available_scripts:
+        # ⚠️ 注意这里：我们依然发出 run_sh:xxx 的指令，由 action 文件去接盘
+        cb_data = f"run_sh:{script['id']}:{instance_id}"
+        builder.append([InlineKeyboardButton(text=script["name"], callback_data=cb_data)])
+    
+    builder.append([InlineKeyboardButton(text="🔙 返回服务器列表", callback_data="back_to_srv_list")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=builder)
+    
+    await call.message.edit_text(
+        f"⚙️ **节点配置中心 (第二步)**\n\n"
+        f"选中实例: `{instance_id}`\n"
+        f"所属地域: {region_name}\n"
+        f"公网IP：`{public_ip}`\n\n"
+        f"👉 请选择要向该服务器下发的 Shell 脚本：",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+# ================= ↩️ 附加步：返回按钮逻辑 =================
+@router.callback_query(F.data == "back_to_srv_list")
+async def back_to_servers(call: CallbackQuery):
+    keyboard = build_servers_keyboard(call.from_user.id)
+    await call.message.edit_text(
+        "⚙️ **节点配置中心 (第一步)**\n\n请在下方悬浮菜单中选择你要操作的服务器：",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+# （原本的第三步执行逻辑已被彻底剥离到 node_actions 目录下的文件中）

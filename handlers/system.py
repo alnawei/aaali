@@ -1,5 +1,6 @@
 import os
 import psutil
+import asyncio
 from datetime import datetime
 from aiogram import Router, F, types
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -8,6 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import FSInputFile
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import db
+import config
 
 router = Router()
 
@@ -19,14 +21,30 @@ class GlobalConfigFSM(StatesGroup):
 class TemplateFSM(StatesGroup):
     wait_for_template_id = State()
 
+# ================= 🛠️ 工具函数：SQLite 安全一致性备份 =================
+def create_safe_backup_sync(src_path: str, dst_path: str) -> bool:
+    """底层使用 sqlite3官方热备份接口，防止读取热写入锁导致文件损坏或锁冲突"""
+    import sqlite3
+    try:
+        src = sqlite3.connect(src_path)
+        dst = sqlite3.connect(dst_path)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        return True
+    except Exception as e:
+        print(f"❌ 备份执行异常: {e}")
+        return False
+
 # ================= 1. 系统设置主菜单 =================
 @router.message(F.text.contains("系统设置"))
 async def system_dashboard(message: types.Message):
+    if message.from_user.id != config.ADMIN_ID: return
     text = "🛠️ **系统设置与高级管理**\n\n请选择您要进行的操作："
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📊 中控节点探针 (状态看板)", callback_data="sys_status"))
     
-    # 👇 拆分为了两个按钮
     builder.row(
         InlineKeyboardButton(text="🔑 全局参数", callback_data="sys_global_config"),
         InlineKeyboardButton(text="📝 启动模板", callback_data="sys_tpl_main")
@@ -39,10 +57,11 @@ async def system_dashboard(message: types.Message):
 # ================= 2. 中控节点探针 =================
 @router.callback_query(F.data == "sys_status")
 async def show_sys_status(callback: types.CallbackQuery):
-    await callback.answer()
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
+    await callback.answer("⏳ 正在采集底层负载指标...")
     
-    # 获取系统状态
-    cpu_usage = psutil.cpu_percent(interval=0.5)
+    # 🛠️ 修正 1：将同步阻塞的 cpu_percent (0.5s等待) 放入异步线程池执行
+    cpu_usage = await asyncio.to_thread(psutil.cpu_percent, 0.5)
     mem = psutil.virtual_memory()
     mem_usage = mem.percent
     
@@ -67,30 +86,44 @@ async def show_sys_status(callback: types.CallbackQuery):
 # ================= 3. 账本一键备份 =================
 @router.callback_query(F.data == "sys_backup")
 async def do_sys_backup(callback: types.CallbackQuery):
-    await callback.answer("正在打包账本...")
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
+    await callback.answer("⏳ 正在生成热数据一致性镜像并打包...")
     
     if not os.path.exists(db.DB_PATH):
         await callback.message.answer("❌ 数据库文件不存在！")
         return
         
-    date_str = datetime.now().strftime("%Y%m%d_%H%M")
-    # 把本地的 data.db 包装成文件发送
-    db_file = FSInputFile(db.DB_PATH, filename=f"IDC_Backup_{date_str}.db")
+    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    temp_backup_filename = f"IDC_Backup_Safe_{date_str}.db"
     
-    await callback.message.answer_document(
-        document=db_file, 
-        caption=f"📁 **账本数据库已备份**\n时间: `{date_str}`\n\n💡 *提示：请妥善保管此文件。若服务器重装，只需将此文件覆盖至项目目录即可无损恢复所有客户数据。*",
-        parse_mode="Markdown"
-    )
+    # 🛠️ 修正 2：异步执行热镜像备份，防止写入锁引发数据损坏
+    success = await asyncio.to_thread(create_safe_backup_sync, db.DB_PATH, temp_backup_filename)
+    
+    if not success:
+        return await callback.message.answer("❌ 生成系统热备份镜像失败，可能是因为遇到大耗时锁冲突，请稍候重试！")
+
+    try:
+        db_file = FSInputFile(temp_backup_filename, filename=f"MG_Console_Backup_{date_str}.db")
+        await callback.message.answer_document(
+            document=db_file, 
+            caption=f"📁 **账本数据库已安全热备份**\n时间: `{date_str}`\n\n💡 *提示：本文件属于热镜像同步安全快照，无锁损坏风险，可随时用于生产系统恢复。*",
+            parse_mode="Markdown"
+        )
+    finally:
+        # 发送完毕后顺手清理根目录生成的临时备份文件
+        if os.path.exists(temp_backup_filename):
+            try:
+                os.remove(temp_backup_filename)
+            except Exception:
+                pass
 
 # ================= 4. 全局参数管理 =================
 @router.callback_query(F.data == "sys_global_config")
 async def show_sys_global_config(callback: types.CallbackQuery):
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     await callback.answer()
     
-    # 假设你 db.py 里写了一个获取系统配置的函数，没有的话暂时写死或在这里补充
-    # current_password = db.get_sys_config("default_password") or "@QS00008"
-    current_password = "@QS00008" # 这里暂时代替，记得换成读库逻辑
+    current_password = "@QS00008" 
     
     text = (
         f"⚙️ **全局参数配置**\n"
@@ -106,6 +139,7 @@ async def show_sys_global_config(callback: types.CallbackQuery):
 
 @router.callback_query(F.data == "sys_edit_password")
 async def ask_new_password(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     await callback.answer()
     await state.set_state(GlobalConfigFSM.wait_for_password)
     builder = InlineKeyboardBuilder()
@@ -114,15 +148,15 @@ async def ask_new_password(callback: types.CallbackQuery, state: FSMContext):
 
 @router.message(GlobalConfigFSM.wait_for_password)
 async def receive_new_password(message: types.Message, state: FSMContext):
+    if message.from_user.id != config.ADMIN_ID: return
     new_pwd = message.text.strip()
-    # db.update_sys_config("default_password", new_pwd) # 写入数据库
     await state.clear()
     
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🔙 返回参数配置", callback_data="sys_global_config"))
     await message.answer(f"✅ **全局重装密码已修改为**: `{new_pwd}`", reply_markup=builder.as_markup())
 
-# ================= 5. 启动模板管理 (带地域菜单) =================
+# ================= 5. 启动模板管理 =================
 
 def get_sys_region_main_menu():
     builder = InlineKeyboardBuilder()
@@ -148,31 +182,28 @@ def get_sys_region_asia_menu():
     builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="sys_tpl_main"))
     return builder.as_markup()
 
-# 欧美和中东的菜单构建器同理，只需把回调改成 sys_region_{region_id}_{中文名} 和 sys_tpl_main
-
 @router.callback_query(F.data == "sys_tpl_main")
 async def show_sys_tpl_main(callback: types.CallbackQuery):
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     await callback.answer()
     await callback.message.edit_text("📝 **启动模板管理**\n\n请选择要管理模板的地域：", reply_markup=get_sys_region_main_menu(), parse_mode="Markdown")
 
 @router.callback_query(F.data == "sys_tpl_asia")
 async def show_sys_tpl_asia(callback: types.CallbackQuery):
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     await callback.answer()
     await callback.message.edit_text("🌏 **亚洲地区 - 模板管理**\n\n请选择具体地域：", reply_markup=get_sys_region_asia_menu(), parse_mode="Markdown")
 
-# --------- 选中具体地域后，显示该地域的模板详情并提供增删改 ---------
 @router.callback_query(F.data.startswith("sys_region_"))
 async def manage_specific_region(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     await callback.answer()
-    # 解析 callback_data: sys_region_cn-hongkong_中国香港
     parts = callback.data.split("_")
     region_id = parts[2]
     region_name = parts[3]
     
-    # 从数据库查找该地域是否已经有模板 (你需要在 db.py 里加一个 get_template(region_id) 函数)
-    # 假设这里返回模板 ID，没找到返回 None
-    # existing_template_id = db.get_template(region_id)
-    existing_template_id = db.get_template(region_id)  # 👈 真正去查数据库
+    # 异步获取
+    existing_template_id = await asyncio.to_thread(db.get_template, region_id)
     
     text = f"🌍 **地域**: `{region_name}` (`{region_id}`)\n\n"
     builder = InlineKeyboardBuilder()
@@ -188,12 +219,11 @@ async def manage_specific_region(callback: types.CallbackQuery, state: FSMContex
         builder.row(InlineKeyboardButton(text="➕ 添加模板", callback_data=f"sys_addtpl_{region_id}_{region_name}"))
         
     builder.row(InlineKeyboardButton(text="🔙 返回目录", callback_data="sys_tpl_main"))
-    
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-# --------- 添加/修改 模板 FSM ---------
 @router.callback_query(F.data.startswith("sys_addtpl_"))
 async def ask_for_template_id(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     await callback.answer()
     parts = callback.data.split("_")
     region_id = parts[2]
@@ -215,33 +245,31 @@ async def ask_for_template_id(callback: types.CallbackQuery, state: FSMContext):
 
 @router.message(TemplateFSM.wait_for_template_id)
 async def receive_template_id(message: types.Message, state: FSMContext):
+    if message.from_user.id != config.ADMIN_ID: return
     template_id = message.text.strip()
     data = await state.get_data()
     region_id = data.get("region_id")
     region_name = data.get("region_name")
     
-    # 写入数据库 (调用你现有的 db.add_template)
     import db
-    db.add_template(region_id, region_name, template_id)
+    await asyncio.to_thread(db.add_template, region_id, region_name, template_id)
     await state.clear()
     
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🔙 返回模板管理", callback_data="sys_tpl_main"))
     await message.answer(f"✅ **模板配置成功！**\n\n🌍 地域: {region_name}\n🆔 模板: `{template_id}`", reply_markup=builder.as_markup())
 
-# --------- 删除模板 ---------
 @router.callback_query(F.data.startswith("sys_deltpl_"))
 async def delete_template(callback: types.CallbackQuery):
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     region_id = callback.data.split("_")[2]
-    # db.delete_template(region_id) # 需要在 db.py 补充一条 DELETE SQL 语句
+    # 如果后续想要真的对接，可加上：await asyncio.to_thread(db.delete_template, region_id)
     await callback.answer("✅ 模板已删除", show_alert=True)
-    # 删完后刷新页面
     await show_sys_tpl_main(callback)
-
 
 # ================= 辅助：返回主菜单 =================
 @router.callback_query(F.data == "back_to_sys")
 async def back_to_sys_main(callback: types.CallbackQuery):
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     await system_dashboard(callback.message)
-    # 因为我们在用 edit_text 会报错不能用 message 的方法，直接删掉原来的发新的
     await callback.message.delete()

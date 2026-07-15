@@ -20,14 +20,25 @@ async def main():
     bot = Bot(token=config.BOT_TOKEN)
     dp = Dispatcher()
 
+    # 🛠️ 修正 1：挂载全局异常捕获中间件/Handler，防止未捕获异常导致红屏及静默失败
+    @dp.error()
+    async def global_error_handler(event):
+        print(f"❌ [全局异常拦截] 捕获到未处理异常: {event.exception}")
+        # 如果需要，这里可以解除注释，让系统向管理员推送崩溃警报
+        # try:
+        #     await bot.send_message(config.ADMIN_ID, f"⚠️ **系统局部发生异常**\n`{event.exception}`")
+        # except:
+        #     pass
+        return True  # 阻止异常继续向上抛出
+
     # 将各个子模块的 Router 拼装到主 Dispatcher 上
     dp.include_router(common.router)
     dp.include_router(server.router)
     dp.include_router(traffic.router)
     dp.include_router(system.router)
 
-    # 挂载节点配置的 UI 主入口
-    dp.include_router(node_router)
+    # 🛠️ 修正 2：修复 NameError，从模块中正确获取 router 对象
+    dp.include_router(node.router)
 
     # 👇 新增下面这几行，挂载对应的按钮执行逻辑
     dp.include_router(bbr_router)

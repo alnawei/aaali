@@ -10,6 +10,12 @@ DB_PATH = os.path.join(BASE_DIR, 'bot_data.db') # 替换为你实际的数据库
 def get_connection():
     return sqlite3.connect(DB_PATH)
 
+def get_active_servers(user_id: int):
+    """查询用户所有有效的服务器，返回包含 instance_id, name, region_id 的字典列表"""
+    # 你的 sqlite3 查询逻辑，例如：
+    # SELECT instance_id, name, region_id FROM ecs_business WHERE user_id = ? AND status = 'Running'
+    pass
+
 def init_db():
     """初始化数据库，创建符合 IDC 商业标准的业务管理表"""
     conn = sqlite3.connect(DB_PATH)
@@ -62,8 +68,8 @@ def get_business_data(instance_id: str) -> dict:
             "traffic_limit_gb": row[1],
             "expire_time": row[2]
         }
-        else:
-        # 如果新开的机器本地还没记账，默认初始化：到期时间为下个自然月     
+    else:
+        # 注意：下面的代码必须向右缩进，被包含在 else 里面
         now = datetime.now()
         year, month, day = now.year, now.month, now.day
         

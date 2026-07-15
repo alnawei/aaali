@@ -1,30 +1,30 @@
-from aiogram import Router, F, types
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+import asyncio
 import sqlite3
 import db
 from datetime import datetime
+from aiogram import Router, F, types
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import config
 
 router = Router()
 
-@router.message(F.text == "📊 流量与计费")
-async def global_billing_dashboard(message: types.Message):
-    # 1. 弹出加载提示
-    wait_msg = await message.answer("🔄 正在生成全局财务与流量报表，请稍候...")
-    
-    # 2. 从本地 SQLite 账本读取所有机器的业务数据
+# ================= 🛠️ 工具函数：异步隔离拉取财务数据 =================
+def fetch_global_billing_data_sync():
     conn = sqlite3.connect(db.DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT instance_id, traffic_limit_gb, expire_time FROM ecs_business")
     rows = cursor.fetchall()
     conn.close()
+    return rows
+
+async def generate_billing_text_and_keyboard():
+    # 放入异步线程池执行拉取操作
+    rows = await asyncio.to_thread(fetch_global_billing_data_sync)
     
     if not rows:
-        await wait_msg.delete()
-        await message.answer("📝 **全局账单总览**\n\n目前数据库中没有任何实例的计费记录。请先在 [💻 服务器管理] 中操作机器。")
-        return
+        return "📝 **全局账单总览**\n\n目前数据库中没有任何实例的计费记录。请先在 [💻 服务器管理] 中操作机器。", None
 
-    # 3. 统计全局数据
     total_instances = len(rows)
     total_allocated_traffic = 0
     expiring_soon_count = 0
@@ -39,24 +39,21 @@ async def global_billing_dashboard(message: types.Message):
         
         total_allocated_traffic += limit_gb
         
-        # 计算是否有即将过期（7天内）的机器
         if expire_time_str:
             try:
                 expire_date = datetime.strptime(expire_time_str, "%Y-%m-%d")
                 days_left = (expire_date - now).days
+                short_id = instance_id[-6:] 
+                
                 if 0 <= days_left <= 7:
                     expiring_soon_count += 1
-                    # 截取实例 ID 的后 6 位，保持面板整洁
-                    short_id = instance_id[-6:] 
-                    expiring_details += f"• `...{short_id}` 剩余 {days_left} 天 ({expire_time_str})\n"
+                    expiring_details += f"• `...{short_id}` 剩余 **{days_left}** 天 ({expire_time_str})\n"
                 elif days_left < 0:
                     expiring_soon_count += 1
-                    short_id = instance_id[-6:]
-                    expiring_details += f"• `...{short_id}` ❌ 已过期 {-days_left} 天\n"
+                    expiring_details += f"• `...{short_id}` ❌ **已过期 {-days_left} 天**\n"
             except ValueError:
                 pass
 
-    # 4. 拼装财务报表面板
     text = (
         "📊 **全局财务与计费总览**\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -70,16 +67,31 @@ async def global_billing_dashboard(message: types.Message):
     else:
         text += "━━━━━━━━━━━━━━━━━━\n✅ 所有实例状态良好，近期无催费任务。"
 
-    # 5. 添加交互按钮 (后续可扩展导出 Excel 账单等功能)
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🔄 刷新全局报表", callback_data="refresh_global_billing"))
     
-    await wait_msg.delete()
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    return text, builder.as_markup()
 
-# 绑定刷新按钮的响应事件
+@router.message(F.text == "📊 流量与计费")
+async def global_billing_dashboard(message: types.Message):
+    if message.from_user.id != config.ADMIN_ID: return
+    wait_msg = await message.answer("🔄 正在生成全局财务与流量报表，请稍候...")
+    
+    text, reply_markup = await generate_billing_text_and_keyboard()
+    
+    await wait_msg.delete()
+    await message.answer(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+# 🛠️ 修正 3：优化按钮更新体验，实现面板内容即时替换与动态无感刷新
 @router.callback_query(F.data == "refresh_global_billing")
 async def refresh_billing(callback: types.CallbackQuery):
-    await callback.answer("刷新中...")
-    # 这里的逻辑和上面一样，你可以选择封装成一个函数复用，为了简单，目前可以直接提示
-    await callback.message.answer("报表已是最新状态。如需再次查看请点击底部菜单。")
+    if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
+    await callback.answer("⏳ 正在重新核算最精准账单数据...")
+    
+    text, reply_markup = await generate_billing_text_and_keyboard()
+    
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception:
+        # 当数据没有实际任何变动触发此异常，安全放过
+        await callback.answer("📊 当前已是最新数据！")

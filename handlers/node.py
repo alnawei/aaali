@@ -56,7 +56,10 @@ async def show_node_list(message: Message):
 # ================= 🚀 第二步：选中服务器，展示文本与脚本清单 =================
 @router.callback_query(F.data.startswith("srv_sel:"))
 async def show_script_options(call: CallbackQuery):
-    _, instance_id = call.data.split(":")
+    try:
+        _, instance_id = call.data.split(":")
+    except ValueError:
+        return await call.answer("数据解析异常！", show_alert=True)
     
     servers = get_servers_data(call.from_user.id)
     srv = next((s for s in servers if s["instance_id"] == instance_id), None)
@@ -78,7 +81,6 @@ async def show_script_options(call: CallbackQuery):
     
     builder = []
     for script in available_scripts:
-        # ⚠️ 注意这里：我们依然发出 run_sh:xxx 的指令，由 action 文件去接盘
         cb_data = f"run_sh:{script['id']}:{instance_id}"
         builder.append([InlineKeyboardButton(text=script["name"], callback_data=cb_data)])
     
@@ -106,5 +108,3 @@ async def back_to_servers(call: CallbackQuery):
         parse_mode="Markdown"
     )
     await call.answer()
-
-# （原本的第三步执行逻辑已被彻底剥离到 node_actions 目录下的文件中）

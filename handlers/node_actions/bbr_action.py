@@ -1,4 +1,5 @@
 import base64
+import asyncio  # 🛠️ 修正：导入异步框架核心工具库
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from alibabacloud_ecs20140526.client import Client as EcsClient
@@ -31,13 +32,16 @@ def get_region_by_instance(user_id: int, instance_id: str) -> str:
                 return srv["region"]
     except Exception:
         pass
-    return "cn-hongkong" # 默认 fallback
+    return "cn-hongkong"  # 默认 fallback
 
 
 # ================= 🚀 1. 渲染 BBR 专属控制面板 =================
 @router.callback_query(F.data.startswith("run_sh:bbr:"))
 async def show_bbr_panel(call: CallbackQuery):
-    _, script_id, instance_id = call.data.split(":")
+    try:
+        _, script_id, instance_id = call.data.split(":")
+    except ValueError:
+        return await call.answer("回调参数格式异常！", show_alert=True)
     
     # 构建 BBR 的专属悬浮键盘
     builder = [
@@ -53,13 +57,11 @@ async def show_bbr_panel(call: CallbackQuery):
             InlineKeyboardButton(text="BBR+CAKE加速", callback_data=f"bbr_cmd:cake:{instance_id}"),
             InlineKeyboardButton(text="BBRplus+FQ版加速", callback_data=f"bbr_cmd:bbrplus:{instance_id}")
         ],
-        # ⚠️ 巧妙的路由设计：直接把 callback_data 指向 node.py 里的 srv_sel，实现无缝返回上一级！
         [InlineKeyboardButton(text="🔙 返回上一级", callback_data=f"srv_sel:{instance_id}")]
     ]
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=builder)
     
-    # 你要求的 UI 文本 (目前为前端展示模板，后期若有状态机可动态替换 🔴🟢)
     text = (
         f"⚡️ **BBR 加速配置中心**\n\n"
         f"当前操作实例：`{instance_id}`\n\n"
@@ -79,7 +81,10 @@ async def show_bbr_panel(call: CallbackQuery):
 # ================= 🚀 2. 接收具体 BBR 指令并调用阿里云 API =================
 @router.callback_query(F.data.startswith("bbr_cmd:"))
 async def execute_bbr_command(call: CallbackQuery):
-    _, action, instance_id = call.data.split(":")
+    try:
+        _, action, instance_id = call.data.split(":")
+    except ValueError:
+        return await call.answer("底层数据包解密异常！", show_alert=True)
     
     # UI 测试模式拦截
     if "testVirtualServer" in instance_id:
@@ -88,16 +93,13 @@ async def execute_bbr_command(call: CallbackQuery):
 
     await call.message.edit_text(f"⏳ 正在向实例 `{instance_id}` 下发 BBR `{action}` 指令，请稍候...", parse_mode="Markdown")
     
-    # 根据用户点击的按钮，生成对应的底层 Shell 脚本
     if action == "install" or action == "fq":
-        # 开启原版 BBR + FQ
         shell_script = (
             "echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf && "
             "echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf && "
             "sysctl -p"
         )
     elif action == "disable":
-        # 恢复默认的 cubic 拥塞控制
         shell_script = (
             "sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf && "
             "sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf && "
@@ -110,7 +112,6 @@ async def execute_bbr_command(call: CallbackQuery):
     elif action == "cake":
         shell_script = "echo 'net.core.default_qdisc=cake' >> /etc/sysctl.conf && echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf && sysctl -p"
     elif action == "bbrplus":
-        # BBRplus 通常需要换内核，这里可以替换为调用你的专属 BBRplus 一键脚本
         shell_script = "echo 'BBRplus 部署脚本待接入...'"
     else:
         shell_script = "echo 'Unknown BBR command'"
@@ -129,10 +130,10 @@ async def execute_bbr_command(call: CallbackQuery):
             timeout=120
         )
         
-        response = await client.run_command_async(request)
+        # 🛠️ 修正核心：强制使用 asyncio.to_thread 调用同步 SDK 的 run_command，避免原框架_async引发的协程死锁！
+        response = await asyncio.to_thread(client.run_command, request)
         invoke_id = response.body.invoke_id
         
-        # 为了体验连贯性，下发成功后，自动保留一个返回上一级的按钮
         back_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="🔙 返回上一级", callback_data=f"srv_sel:{instance_id}")]]
         )
@@ -146,9 +147,10 @@ async def execute_bbr_command(call: CallbackQuery):
             parse_mode="Markdown"
         )
     except Exception as e:
+        # 🛠️ 修正：当发生网络或阿里云API报错时，去掉 Markdown 解析模式，直接以普通文本输出错误堆栈，防止因带特殊字符引发 TG BadRequest
         await call.message.edit_text(
-            f"❌ **指令下发失败**\n\n错误原因：\n`{str(e)}`",
-            parse_mode="Markdown"
+            f"❌ 指令下发失败\n\n错误原因：\n{str(e)}",
+            parse_mode=None
         )
     finally:
         await call.answer()

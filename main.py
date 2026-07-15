@@ -5,6 +5,9 @@ import tasks
 import config
 from handlers import common, server, traffic, node, system
 
+from handlers.node_actions.bbr_action import router as bbr_router
+from handlers.node_actions.xui_action import router as xui_router
+from handlers.node_actions.mgui_action import router as mgui_router
 # 👇 1. 导入 init_db 函数
 from db import init_db 
 
@@ -21,8 +24,15 @@ async def main():
     dp.include_router(common.router)
     dp.include_router(server.router)
     dp.include_router(traffic.router)
-    dp.include_router(node.router)
     dp.include_router(system.router)
+
+    # 挂载节点配置的 UI 主入口
+    dp.include_router(node_router)
+
+    # 👇 新增下面这几行，挂载对应的按钮执行逻辑
+    dp.include_router(bbr_router)
+    dp.include_router(xui_router)
+    dp.include_router(mgui_router)
 
     # ==================== 流量监控定时任务 ====================
     scheduler = AsyncIOScheduler()

@@ -73,7 +73,6 @@ async def show_script_options(call: CallbackQuery):
         {"id": "bbr", "name": "🟢 bbr加速"},
         {"id": "xui", "name": "🔴 x-ui面板"},
         {"id": "mgui", "name": "🔴 MG 私有面板"},
-        {"id": "toolbox", "name": "🔴 运维工具箱 (快捷键 k)"},
     ]
     
     builder = []

@@ -3,6 +3,9 @@ import calendar
 import logging
 from datetime import datetime
 import config  # 统一从 config 获取配置与路径
+import os
+
+DB_PATH = config.DB_PATH  # ⭐ 就是加在这里！导出给 tasks.py 等外部模块调用
 
 logger = logging.getLogger("MG_Bot.DB")
 

@@ -1,181 +1,241 @@
-import base64
 import asyncio
-import time
-from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from alibabacloud_ecs20140526.client import Client as EcsClient
-from alibabacloud_ecs20140526 import models as ecs_models
-from alibabacloud_tea_openapi import models as open_api_models
-
+import sqlite3
+from aiogram import Router, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import config
-from db import get_active_servers
 
 router = Router()
 
-def get_ecs_client(region_id: str) -> EcsClient:
-    config_model = open_api_models.Config(
-        access_key_id=config.ALIYUN_ACCESS_KEY_ID,      
-        access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET 
-    )
-    config_model.endpoint = f'ecs.{region_id}.aliyuncs.com'
-    return EcsClient(config_model)
-
-def encode_command(command: str) -> str:
-    return base64.b64encode(command.encode('utf-8')).decode('utf-8')
-
-def get_region_by_instance(user_id: int, instance_id: str) -> str:
+# ================= 🛠️ 底层工具：获取服务器真 IP =================
+def get_server_ip(instance_id: str) -> str:
+    """从数据库中查询实例的公网 IP"""
     try:
-        servers = get_active_servers(user_id)
-        for srv in servers:
-            if srv["instance_id"] == instance_id:
-                return srv["region"]
+        db_path = getattr(config, 'DB_PATH', '/srv/aali/bot_data.db')
+        conn = sqlite3.connect(db_path, timeout=3.0)
+        cursor = conn.cursor()
+        for table in ["ecs_business", "servers", "ecs_instances", "instances"]:
+            try:
+                cursor.execute(f"SELECT ip FROM {table} WHERE instance_id = ? LIMIT 1", (instance_id,))
+                row = cursor.fetchone()
+                if row and row[0] and "0.0.0" not in str(row[0]):
+                    conn.close()
+                    return row[0].strip()
+            except Exception:
+                continue
+        conn.close()
     except Exception:
         pass
-    return "cn-hongkong" 
+    return "127.0.0.1" # 兜底本地测试 IP
 
-def fetch_command_output_sync(client: EcsClient, region_id: str, invoke_id: str) -> str:
-    req = ecs_models.DescribeInvocationResultsRequest(region_id=region_id, invoke_id=invoke_id)
-    for _ in range(5):
-        time.sleep(2)
-        try:
-            resp = client.describe_invocation_results(req)
-            if resp.body.invocation and resp.body.invocation.invocation_results.invocation_result:
-                res = resp.body.invocation.invocation_results.invocation_result[0]
-                if res.invocation_state in ["Success", "Failed", "Finished"]:
-                    output_b64 = res.output or ""
-                    if not output_b64:
-                        return "指令已执行，但终端无文字回显。"
-                    return base64.b64decode(output_b64).decode('utf-8', errors='ignore').strip()
-        except Exception:
-            continue
-    return "⏳ 查询超时：后台任务仍运行中，请稍候点击探测刷新。"
 
-def build_bbr_keyboard(instance_id: str) -> InlineKeyboardMarkup:
-    builder = [
-        [InlineKeyboardButton(text="🔍 实时探测当前 Linux 内核 BBR 状态", callback_data=f"bbr_cmd:check:{instance_id}")],
-        [
-            InlineKeyboardButton(text="🟢 开启 BBR+FQ (推荐)", callback_data=f"bbr_cmd:bbr_fq:{instance_id}"),
-            InlineKeyboardButton(text="🛑 停用加速 (恢复Cubic)", callback_data=f"bbr_cmd:stop:{instance_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🚀 BBR+FQ_PIE (新内核)", callback_data=f"bbr_cmd:bbr_fq_pie:{instance_id}"),
-            InlineKeyboardButton(text="🚀 BBR+CAKE (抗丢包)", callback_data=f"bbr_cmd:bbr_cake:{instance_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🔥 BBRplus 魔改参数", callback_data=f"bbr_cmd:bbr_plus:{instance_id}"),
-            InlineKeyboardButton(text="🔄 重启服务器 (配置生效)", callback_data=f"bbr_cmd:reboot:{instance_id}")
-        ],
-        [InlineKeyboardButton(text="🔙 返回服务器列表", callback_data=f"srv_sel:{instance_id}")]
+# ================= 🔍 核心算法：通过 SSH 实时探测当前 BBR 模版 =================
+def sync_check_bbr_status(ip: str) -> str:
+    """
+    同步执行 SSH 探活，返回当前生效的模版 ID:
+    'cubic' / 'fq' / 'fq_pie' / 'cake' / 'bbrplus' / 'unknown'
+    """
+    if not ip or "0.0.0" in ip or "分配中" in ip:
+        return "unknown"
+        
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        pwd = getattr(config, 'SSH_PASSWORD', '@QS00008')
+        
+        # 1.5秒极速连接并查询内核拥塞控制和队列算法
+        client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=1.5)
+        cmd = "sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc"
+        stdin, stdout, stderr = client.exec_command(cmd, timeout=1.5)
+        output = stdout.read().decode('utf-8').lower()
+        client.close()
+        
+        # 按照优先级解析内核返回结果
+        if "cubic" in output:
+            return "cubic"
+        elif "bbrplus" in output:
+            return "bbrplus"
+        elif "bbr" in output:
+            if "fq_pie" in output: return "fq_pie"
+            if "cake" in output: return "cake"
+            return "fq" # 默认标准 fq
+        else:
+            return "cubic"
+    except Exception:
+        return "unknown" # SSH 超时或失败
+
+
+# ================= 🚀 底层执行：一键修改内核参数并热加载 =================
+def sync_apply_bbr_script(ip: str, target_template: str) -> tuple[bool, str]:
+    """通过 SSH 执行 sysctl 修改并立刻生效，无需重启！"""
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        pwd = getattr(config, 'SSH_PASSWORD', '@QS00008')
+        client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=3.0)
+        
+        # 清理旧的参数配置
+        clean_cmd = "sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf && sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf"
+        client.exec_command(clean_cmd)
+        
+        # 构建新的内核配置指令
+        if target_template == "cubic":
+            apply_cmd = "echo 'net.ipv4.tcp_congestion_control=cubic' >> /etc/sysctl.conf && echo 'net.core.default_qdisc=fq_codel' >> /etc/sysctl.conf"
+        elif target_template == "fq":
+            apply_cmd = "echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf && echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf"
+        elif target_template == "fq_pie":
+            apply_cmd = "echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf && echo 'net.core.default_qdisc=fq_pie' >> /etc/sysctl.conf"
+        elif target_template == "cake":
+            apply_cmd = "echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf && echo 'net.core.default_qdisc=cake' >> /etc/sysctl.conf"
+        elif target_template == "bbrplus":
+            apply_cmd = "echo 'net.ipv4.tcp_congestion_control=bbrplus' >> /etc/sysctl.conf && echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf"
+        else:
+            return False, "未知参数"
+
+        # 写入并重新加载 sysctl
+        full_cmd = f"{apply_cmd} && sysctl -p"
+        stdin, stdout, stderr = client.exec_command(full_cmd, timeout=3.0)
+        err = stderr.read().decode('utf-8')
+        client.close()
+        
+        if "No such file" in err or "cannot stat" in err:
+            return False, "当前系统内核不支持该队列算法，请升级内核"
+        return True, "配置已热加载生效"
+    except Exception as e:
+        return False, f"SSH连接或执行异常: {str(e)}"
+
+
+# ================= 🎨 UI 构建：动态生成互斥亮灯键盘 =================
+def build_bbr_keyboard(instance_id: str, active_status: str) -> InlineKeyboardMarkup:
+    """根据 active_status 动态构建 1 + 2 + 2 + 1 键盘矩阵"""
+    
+    # 1. 定义 4 个基础模版
+    templates = [
+        {"id": "fq", "name": "BBR+FQ (标准)"},
+        {"id": "fq_pie", "name": "BBR+FQ_PIE (新内核)"},
+        {"id": "cake", "name": "BBR+CAKE (抗丢包)"},
+        {"id": "bbrplus", "name": "BBRplus 魔改"},
     ]
+    
+    # 2. 构建顶条按钮 (状态看板 / 卸载总开关)
+    if active_status in ["cubic", "unknown"]:
+        # 未开 BBR：呈现为不可点的状态看板（或点击提示下面选）
+        top_btn_text = "🔴 当前状态: 默认 Cubic (请在下方选择模版开启)"
+        top_btn_data = f"bbr_noop:{instance_id}"
+    else:
+        # 已开 BBR：呈现为红色的卸载总开关！
+        active_name = next((t["name"].split()[0] for t in templates if t["id"] == active_status), "BBR")
+        top_btn_text = f"🟢 运行中: {active_name} ［ 🔴 点击停用 / 恢复Cubic ］"
+        top_btn_data = f"bbr_set:cubic:{instance_id}"
+        
+    builder = [[InlineKeyboardButton(text=top_btn_text, callback_data=top_btn_data)]]
+    
+    # 3. 构建中间 4 个模版按钮 (互斥单选：当前生效的亮🟢，其余全是⚪)
+    row_temp = []
+    for t in templates:
+        icon = "🟢" if active_status == t["id"] else "⚪"
+        btn_text = f"{icon} {t['name']}"
+        cb_data = f"bbr_set:{t['id']}:{instance_id}"
+        row_temp.append(InlineKeyboardButton(text=btn_text, callback_data=cb_data))
+        
+        if len(row_temp) == 2:
+            builder.append(row_temp)
+            row_temp = []
+            
+    # 4. 构建底部返回按钮
+    builder.append([InlineKeyboardButton(text="🔙 返回上一级 (脚本清单)", callback_data=f"srv_sel:{instance_id}")])
+    
     return InlineKeyboardMarkup(inline_keyboard=builder)
 
-# ================= 1. 渲染 BBR 控制面板 =================
+
+# ================= ⚡️ 回调路由 1：进入 BBR 控制中心 =================
 @router.callback_query(F.data.startswith("run_sh:bbr:"))
-async def show_bbr_panel(call: CallbackQuery):
+async def show_bbr_center(call: CallbackQuery):
+    """从脚本清单点击 [bbr加速] 时触发"""
     try:
-        _, script_id, instance_id = call.data.split(":")
+        _, _, instance_id = call.data.split(":")
     except ValueError:
-        return await call.answer("回调参数异常！", show_alert=True)
+        return await call.answer("数据解析异常", show_alert=True)
+        
+    ip = get_server_ip(instance_id)
     
-    keyboard = build_bbr_keyboard(instance_id)
-    text = (
-        f"⚡️ <b>BBR 网络吞吐与拥塞控制中心</b>\n\n"
-        f"🖥 <b>当前操作实例</b>：<code>{instance_id}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 <b>参数说明与运维指南</b>：\n"
-        f"• <b>标准 BBR+FQ</b>：适合 90% 的跨境 Linux 场景，能极大压榨带宽、平稳抗丢包。\n"
-        f"• <b>FQ_PIE / CAKE</b>：针对高并发及严重丢包链路优化的现代 AQM 队列算法。\n"
-        f"• <b>配置生效</b>：内核参数修改后，建议点击底部 <b>[🔄 重启服务器]</b> 彻底释放队列。\n\n"
-        f"👇 <b>请点击最上方 [🔍 实时探测] 检查当前拥塞控制算法，或下发加速配置：</b>"
+    # 先显示一个加载提示，防止 SSH 探活时卡顿
+    await call.message.edit_text(
+        f"⚡️ **BBR 网络吞吐与拥塞控制中心**\n\n"
+        f"🖥 当前操作实例：`{instance_id}`\n"
+        f"🌐 当前 IP：`{ip}`\n\n"
+        f"⏳ *正在通过 SSH 实时探测远端 Linux 内核状态，请稍候...*",
+        parse_mode="Markdown"
     )
-    await call.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    
+    # 异步多线程执行探活
+    active_status = await asyncio.to_thread(sync_check_bbr_status, ip)
+    
+    # 渲染最终动态界面
+    keyboard = build_bbr_keyboard(instance_id, active_status)
+    
+    text = (
+        f"⚡️ **BBR 网络吞吐与拥塞控制中心**\n\n"
+        f"🖥 当前操作实例：`{instance_id}`\n"
+        f"🌐 当前 IP：`{ip}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 **参数说明与运维指南：**\n"
+        f"• **标准 BBR+FQ**：适合 90% 的跨境 Linux 场景，极大压榨带宽、平稳抗丢包。\n"
+        f"• **FQ_PIE / CAKE**：针对高并发及严重丢包链路优化的现代 AQM 队列算法。\n"
+        f"• **极速热加载**：本次调优采用 `sysctl` 内核动态注入，**修改瞬间生效，无需重启服务器**！\n\n"
+        f"👇 *请在下方选单中点击相应模版进行动态热切换：*"
+    )
+    
+    await call.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     await call.answer()
 
-# ================= 2. 执行 BBR 底层指令 =================
-@router.callback_query(F.data.startswith("bbr_cmd:"))
-async def execute_bbr_command(call: CallbackQuery):
+
+# ================= ⚡️ 回调路由 2：执行 BBR 模版切换 / 恢复 Cubic =================
+@router.callback_query(F.data.startswith("bbr_set:"))
+async def execute_bbr_switch(call: CallbackQuery):
+    """点击具体模版或者顶部卸载开关时触发"""
     try:
-        _, action, instance_id = call.data.split(":")
+        _, target_template, instance_id = call.data.split(":")
     except ValueError:
-        return await call.answer("解密异常！", show_alert=True)
+        return await call.answer("数据异常", show_alert=True)
         
-    if "testVirtualServer" in instance_id:
-        return await call.answer(f"测试模式：模拟执行【{action}】！", show_alert=True)
-
-    await call.message.edit_text(f"⏳ 正在向实例 <code>{instance_id}</code> 下发 BBR <code>{action}</code> 指令...", parse_mode="HTML")
+    ip = get_server_ip(instance_id)
     
-    if action == "check":
-        shell_script = "sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc && uname -r"
-    elif action == "bbr_fq":
-        shell_script = """
-sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-sysctl -p
-echo "BBR_FQ_SUCCESS"
-"""
-    elif action == "bbr_fq_pie":
-        shell_script = """
-sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-echo "net.core.default_qdisc = fq_pie" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-sysctl -p
-echo "BBR_FQ_PIE_SUCCESS"
-"""
-    elif action == "bbr_cake":
-        shell_script = """
-sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-echo "net.core.default_qdisc = cake" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-sysctl -p
-echo "BBR_CAKE_SUCCESS"
-"""
-    elif action == "stop":
-        shell_script = """
-sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-echo "net.core.default_qdisc = pfifo_fast" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control = cubic" >> /etc/sysctl.conf
-sysctl -p
-echo "STOP_SUCCESS"
-"""
-    elif action == "reboot":
-        shell_script = "reboot && echo 'REBOOTING'"
+    # 交互反馈：正在下发指令
+    temp_msg = await call.message.edit_text(
+        f"🔄 **正在向服务器 `{ip}` 热加载内核参数...**\n请稍候 1-2 秒...",
+        parse_mode="Markdown"
+    )
+    
+    # 异步向服务器下发 sysctl 修改
+    success, msg = await asyncio.to_thread(sync_apply_bbr_script, ip, target_template)
+    
+    if success:
+        await call.answer("🎉 配置已修改并立刻生效！", show_alert=True)
     else:
-        shell_script = "echo 'Unknown Command'"
-
-    try:
-        region_id = get_region_by_instance(call.from_user.id, instance_id)
-        client = get_ecs_client(region_id)
-        req = ecs_models.RunCommandRequest(
-            region_id=region_id, type='RunShellScript', command_content=encode_command(shell_script),
-            instance_id=[instance_id], name=f"MG_BBR_{action}", timeout=60
-        )
-        resp = await asyncio.to_thread(client.run_command, req)
+        await call.answer(f"⚠️ 切换提示: {msg}", show_alert=True)
         
-        if action == "reboot":
-            await call.message.edit_text(f"🔄 <b>服务器正在重启！</b>\n\n实例 <code>{instance_id}</code> 将在 30 秒后重载内核并重新连接公网。", parse_mode="HTML")
-            return
+    # ⭐ 绝杀体验：执行完后，立刻在后台再探活一次，无缝刷新界面的绿灯位置！
+    new_status = await asyncio.to_thread(sync_check_bbr_status, ip)
+    keyboard = build_bbr_keyboard(instance_id, new_status)
+    
+    # 恢复主界面展示
+    text = (
+        f"⚡️ **BBR 网络吞吐与拥塞控制中心**\n\n"
+        f"🖥 当前操作实例：`{instance_id}`\n"
+        f"🌐 当前 IP：`{ip}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 **参数说明与运维指南：**\n"
+        f"• **标准 BBR+FQ**：适合 90% 的跨境 Linux 场景，极大压榨带宽、平稳抗丢包。\n"
+        f"• **FQ_PIE / CAKE**：针对高并发及严重丢包链路优化的现代 AQM 队列算法。\n"
+        f"• **极速热加载**：本次调优采用 `sysctl` 内核动态注入，**修改瞬间生效，无需重启服务器**！\n\n"
+        f"👇 *请在下方选单中点击相应模版进行动态热切换：*"
+    )
+    await temp_msg.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
-        out = await asyncio.to_thread(fetch_command_output_sync, client, region_id, resp.body.invoke_id)
-        keyboard = build_bbr_keyboard(instance_id)
-        
-        if action == "check":
-            await call.message.edit_text(
-                f"📡 <b>Linux BBR 内核拥塞状态探测报告</b>\n\n"
-                f"🖥 <b>物理机实例</b>：<code>{instance_id}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"终端内核参数回显：\n<code>{out}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"💡 <i>提示：如果看到 <code>tcp_congestion_control = bbr</code> 即代表加速已完全启动！</i>",
-                reply_markup=keyboard, parse_mode="HTML"
-            )
-        else:
-            await call.message.edit_text(f"✅ <b>BBR 加速策略配置成功！</b>\n\n🖥 实例ID：<code>{instance_id}</code>\n内核参数已实时载入生效。你可以点击最上方「🔍 实时探测」验证当前算法！", reply_markup=keyboard, parse_mode="HTML")
-    except Exception as e:
-        await call.message.edit_text(f"❌ 指令执行失败：\n{str(e)}", parse_mode=None)
-    finally:
-        await call.answer()
+
+# ================= ⚡️ 回调路由 3：点击顶部纯提示看板时的防呆处理 =================
+@router.callback_query(F.data.startswith("bbr_noop:"))
+async def bbr_noop_handler(call: CallbackQuery):
+    await call.answer("💡 当前未开启加速，请点击下方的白色 ⚪ 模版按钮开启！", show_alert=True)

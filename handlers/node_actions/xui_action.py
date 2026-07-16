@@ -17,11 +17,14 @@ from db import get_active_servers
 
 router = Router()
 
-# ================= 🛠️ FSM 状态机：SOCKS 节点与上游转发 =================
-class XuiSocksFSM(StatesGroup):
-    wait_for_port = State()
-    wait_for_auth = State()
-    wait_for_upstream = State()
+# ================= 🛠️ FSM 状态机 =================
+class XuiRealityFSM(StatesGroup):
+    wait_for_upstream = State()  # 等待输入上游 SOCKS 转发
+    wait_for_limit = State()     # 等待输入流量限额(GB)
+
+class XuiLimitFSM(StatesGroup):
+    wait_for_port = State()      # 等待输入要修改的端口号
+    wait_for_new_limit = State() # 等待输入新流量上限/清零
 
 # ================= 🛠️ 底层客户端与工具函数 =================
 def get_ecs_client(region_id: str) -> EcsClient:
@@ -69,9 +72,9 @@ def build_xui_keyboard(instance_id: str, is_running: bool = True) -> InlineKeybo
         toggle_btn = InlineKeyboardButton(text="🟢 启动 / 重启面板服务", callback_data=f"xui_cmd:start:{instance_id}")
 
     builder = [
-        # ⭐ 独家新增：两大杀手锏功能排在顶部黄金视觉区
-        [InlineKeyboardButton(text="⚡️ 一键生成 VLESS-Reality 苹果CDN节点", callback_data=f"xui_cmd:add_reality:{instance_id}")],
-        [InlineKeyboardButton(text="🧦 一键新增 SOCKS 节点 (含上游中转转发)", callback_data=f"xui_cmd:add_socks_start:{instance_id}")],
+        # ⭐ 核心功能全新矩阵：最强伪装、中转落地、流量管控，尽在顶排！
+        [InlineKeyboardButton(text="⚡️ 一键生成 VLESS-Reality (含住宅中转 & 500G限额)", callback_data=f"xui_cmd:add_reality_start:{instance_id}")],
+        [InlineKeyboardButton(text="📊 修改端口流量限额 / 流量一键清零", callback_data=f"xui_cmd:modify_limit_start:{instance_id}")],
         [InlineKeyboardButton(text="🔍 实时探测状态 & 查看登录账号密码", callback_data=f"xui_cmd:check:{instance_id}")],
         [
             InlineKeyboardButton(text="🟢 一键部署/重装 (固定端口54321)", callback_data=f"xui_cmd:install:{instance_id}"),
@@ -106,16 +109,16 @@ async def show_xui_panel(call: CallbackQuery):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🌐 <b>默认固定端口</b>：<code>54321</code> | 👤 <b>账号</b>：<code>admin</code> | 🔑 <b>密码</b>：<code>admin</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 <b>高阶功能指南</b>：\n"
-        f"• <b>VLESS-Reality</b>：全自动适配 Apple CDN 伪装域名与 X25519 证书，超抗封锁，一键出链接！\n"
-        f"• <b>SOCKS 转发</b>：支持向导式创建 SOCKS5 节点，并集成外部 SOCKS 代理的中转转发配置。\n\n"
+        f"💡 <b>核心高阶功能架构</b>：\n"
+        f"• <b>VLESS-Reality</b>：融合苹果 CDN 顶级伪装 + <b>住宅 IP 中转路由</b>，默认赋予 <b>500GB 细粒度管控</b>！\n"
+        f"• <b>流量管控</b>：随时点击「📊 修改端口流量限额」，可对任意节点实时调整额度并实现一键清零！\n\n"
         f"👇 <b>请选择要向该远程机器下发的 X-UI 极速管理指令：</b>"
     )
     await call.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await call.answer()
 
 
-# ================= 🚀 2. 接收基础管理指令与快捷添加指令 =================
+# ================= 🚀 2. 接收管理指令与触发 FSM =================
 @router.callback_query(F.data.startswith("xui_cmd:"))
 async def execute_xui_command(call: CallbackQuery, state: FSMContext):
     try:
@@ -126,57 +129,35 @@ async def execute_xui_command(call: CallbackQuery, state: FSMContext):
     if "testVirtualServer" in instance_id:
         return await call.answer(f"UI 测试模式：已模拟向 3x-ui 执行【{action}】！", show_alert=True)
 
-    # 🛑 拦截点 1：触发 SOCKS 节点交互向导
-    if action == "add_socks_start":
-        await state.update_data(socks_instance_id=instance_id)
-        await state.set_state(XuiSocksFSM.wait_for_port)
+    # 🛑 拦截点 1：触发 VLESS-Reality 生成向导
+    if action == "add_reality_start":
+        await state.update_data(reality_instance_id=instance_id)
+        await state.set_state(XuiRealityFSM.wait_for_upstream)
         await call.message.answer(
-            f"🧦 <b>配置新的 SOCKS 代理节点</b>\n\n"
-            f"👉 请回复想要为 SOCKS 开放的<b>监听端口</b> (纯数字，如 <code>1080</code> 或 <code>20000</code>)：\n\n"
-            f"<i>(回复 0 将由系统随机生成；发送 /cancel 取消)</i>",
+            f"⚡️ <b>创建 VLESS-Reality (苹果 CDN 伪装) 节点</b>\n\n"
+            f"👉 <b>第一步：是否配置【上游住宅 SOCKS 中转】？</b>\n"
+            f"如果想让流量经过阿里云中转至海外住宅 IP 出去，请严格回复：\n"
+            f"<code>IP:端口:账号:密码</code> (例如 <code>1.2.3.4:1080:proxyuser:proxypass</code>)\n\n"
+            f"🚀 <i>如果不需要中转（直接用阿里云原生 BGP 宽带直连落地），请直接回复 <b>0</b></i>",
+            parse_mode="HTML"
+        )
+        return await call.answer()
+
+    # 🛑 拦截点 2：触发流量限额修改向导
+    if action == "modify_limit_start":
+        await state.update_data(limit_instance_id=instance_id)
+        await state.set_state(XuiLimitFSM.wait_for_port)
+        await call.message.answer(
+            f"📊 <b>修改端口流量限额 / 流量一键清零</b>\n\n"
+            f"👉 请回复想要修改或清零的<b>节点监听端口号</b> (纯数字，例如 <code>48991</code>)：\n\n"
+            f"<i>(发送 /cancel 随时取消当前操作)</i>",
             parse_mode="HTML"
         )
         return await call.answer()
 
     await call.message.edit_text(f"⏳ 正在向实例 <code>{instance_id}</code> 下发 3x-ui <code>{action}</code> 指令，请稍候...", parse_mode="HTML")
     
-    # 🛑 拦截点 2：一键生成 VLESS-Reality (Apple CDN 伪装)
-    if action == "add_reality":
-        shell_script = """python3 -c "
-import sqlite3, json, subprocess, uuid, random, os
-try:
-    xray_bin = subprocess.check_output('find /usr/local/x-ui/bin -name \"xray*\" -type f | head -n 1', shell=True).decode().strip()
-    key_out = subprocess.check_output(f'{xray_bin} x25519', shell=True).decode()
-    priv_key, pub_key = '', ''
-    for line in key_out.split('\\n'):
-        if 'Private' in line or 'private' in line: priv_key = line.split(':')[-1].strip()
-        elif 'Public' in line or 'public' in line: pub_key = line.split(':')[-1].strip()
-except Exception:
-    priv_key, pub_key = 'yNu1z_fallback_private_key_replace_me', 'zMu1z_fallback_public_key_replace_me'
-
-client_id = str(uuid.uuid4())
-short_id = ''.join(random.choices('0123456789abcdef', k=8))
-port = random.randint(40000, 58000)
-
-settings = {'clients': [{'id': client_id, 'flow': 'xtls-rprx-vision', 'email': f'reality_apple_{port}'}], 'decryption': 'none'}
-stream_settings = {
-    'network': 'tcp', 'security': 'reality',
-    'realitySettings': {
-        'show': False, 'dest': 'www.apple.com:443', 'xver': 0,
-        'serverNames': ['www.apple.com', 'apple.com', 'gateway.icloud.com'],
-        'privateKey': priv_key, 'minClientVer': '', 'maxClientVer': '', 'maxTimediff': 0, 'shortIds': [short_id]
-    }
-}
-
-conn = sqlite3.connect('/etc/x-ui/x-ui.db')
-c = conn.cursor()
-c.execute('''INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-             VALUES (1, 0, 0, 0, 'VLESS_Reality_Apple', 1, 0, '', ?, 'vless', ?, ?, ?, '{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"]}')''',
-          (port, json.dumps(settings), json.dumps(stream_settings), f'inbound-{port}'))
-conn.commit(); conn.close()
-print(f'REALITY_RES:{port}|{client_id}|{pub_key}|{short_id}')
-" && systemctl restart x-ui && echo "ADD_REALITY_SUCCESS" """
-    elif action == "check":
+    if action == "check":
         shell_script = """python3 -c "
 import os, sqlite3
 status_panel = 'running' if os.system('systemctl is-active --quiet x-ui') == 0 else 'stopped'
@@ -246,41 +227,6 @@ echo "UNINSTALL_SUCCESS"
         response = await asyncio.to_thread(client.run_command, request)
         invoke_id = response.body.invoke_id
         
-        if action == "add_reality":
-            real_output = await asyncio.to_thread(fetch_command_output_sync, client, region_id, invoke_id)
-            port, client_id, pub_key, short_id = "未知", "未知", "未知", "未知"
-            for line in real_output.split("\n"):
-                if line.startswith("REALITY_RES:"):
-                    try: port, client_id, pub_key, short_id = line.split(":", 1)[1].split("|")
-                    except Exception: pass
-            
-            # 获取公网 IP 用于生成订阅链接
-            try:
-                ip_req = ecs_models.DescribeInstancesRequest(region_id=region_id, instance_ids=json.dumps([instance_id]))
-                ip_resp = client.describe_instances(ip_req)
-                pub_ip = ip_resp.body.instances.instance[0].public_ip_address.ip_address[0]
-            except Exception:
-                pub_ip = "服务器公网IP"
-                
-            vless_link = (
-                f"vless://{client_id}@{pub_ip}:{port}?security=reality&encryption=none&pbk={pub_key}"
-                f"&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid={short_id}#Apple_CDN_Reality"
-            )
-            
-            keyboard = build_xui_keyboard(instance_id, is_running=True)
-            await call.message.edit_text(
-                f"🎉 <b>VLESS-XTLS-Reality 苹果CDN伪装节点创建成功！</b>\n\n"
-                f"🖥 <b>物理机实例</b>：<code>{instance_id}</code>\n"
-                f"🔌 <b>节点监听端口</b>：<code>{port}</code>\n"
-                f"🍎 <b>伪装 CDN 域名</b>：<code>www.apple.com:443</code>\n"
-                f"🛡️ <b>流控与传输层</b>：<code>xtls-rprx-vision</code> (TCP 留空)\n\n"
-                f"🚀 <b>一键直连/订阅链接 (直接复制导入 v2rayN/小火箭)：</b>\n"
-                f"<code>{vless_link}</code>\n\n"
-                f"💡 <i>Reality 证书已自动在内存映射，无需购买证书，抗封锁能力拉满！请去安全组放行 {port} 端口！</i>",
-                reply_markup=keyboard, parse_mode="HTML"
-            )
-            return
-
         if action == "check":
             real_output = await asyncio.to_thread(fetch_command_output_sync, client, region_id, invoke_id)
             data_map = {}
@@ -329,7 +275,7 @@ echo "UNINSTALL_SUCCESS"
                 f"✅ <b>指令下发成功！</b>\n\n"
                 f"🖥 <b>物理机实例</b>：<code>{instance_id}</code>\n"
                 f"⏳ <b>执行动作</b>：一键自动化运维 ({action})\n\n"
-                f"任务已在后台执行（约需40秒），稍后点击「🔍 实时探测」即可核实状态！",
+                f"任务已在后台自动执行（约需40秒），完成后点击「🔍 实时探测」即可核对部署状态！",
                 reply_markup=keyboard, parse_mode="HTML"
             )
     except Exception as e:
@@ -338,121 +284,213 @@ echo "UNINSTALL_SUCCESS"
         await call.answer()
 
 
-# ================= 🚀 3. SOCKS 节点向导处理步骤 =================
-@router.message(XuiSocksFSM.wait_for_port)
-async def xui_socks_step1(message: Message, state: FSMContext):
+# ================= 🚀 3. FSM：VLESS-Reality + 住宅中转 + 流量限额 =================
+@router.message(XuiRealityFSM.wait_for_upstream)
+async def xui_reality_step1(message: Message, state: FSMContext):
     text = message.text.strip()
-    if text == '0':
-        port = str(random.randint(10000, 50000))
-    else:
-        if not text.isdigit():
-            return await message.answer("❌ 格式错误，请输入纯数字端口号 (如 1080)：")
-        port = text
-    await state.update_data(socks_port=port)
-    await state.set_state(XuiSocksFSM.wait_for_auth)
+    await state.update_data(reality_upstream=text if text != '0' else "")
+    await state.set_state(XuiRealityFSM.wait_for_limit)
     await message.answer(
-        f"✅ 已设定监听端口：<b>{port}</b>\n\n"
-        f"👉 请回复该 SOCKS 节点的<b>登录账号与密码</b>，用空格分开 (例如 <code>user123 pass123</code>)：\n"
-        f"<i>(回复 0 将由系统随机生成；回复 none 则免密连接)</i>",
+        f"✅ 上游中转出口：<b>{'已配置外部转发' if text != '0' else '阿里云本机原生 IP 直连'}</b>\n\n"
+        f"👉 <b>第二步：请输入该端口节点的【月度流量限额 (GB)】</b>\n"
+        f"⚡️ <i>默认赋予 <b>500</b> GB，请直接回复数字 <code>500</code>；如需不限流量请回复 <code>0</code></i>",
         parse_mode="HTML"
     )
 
-@router.message(XuiSocksFSM.wait_for_auth)
-async def xui_socks_step2(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if text == '0':
-        user = f"user_{random.randint(100, 999)}"
-        pwd = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
-    elif text.lower() == 'none':
-        user, pwd = "", ""
-    else:
-        parts = text.split()
-        if len(parts) < 2:
-            return await message.answer("❌ 格式错误，请用空格分隔账号和密码 (如 `myuser mypass`)：")
-        user, pwd = parts[0], parts[1]
+@router.message(XuiRealityFSM.wait_for_limit)
+async def xui_reality_step2(message: Message, state: FSMContext):
+    try:
+        limit_gb = float(message.text.strip())
+    except ValueError:
+        return await message.answer("❌ 格式错误，请输入纯数字 (例如 `500` 或 `0`):")
         
-    await state.update_data(socks_user=user, socks_pwd=pwd)
-    await state.set_state(XuiSocksFSM.wait_for_upstream)
-    await message.answer(
-        f"✅ 已设定鉴权账号：<b>{user or '免密'}</b>\n\n"
-        f"👉 <b>是否需要配置「上游 SOCKS 中转转发」？</b>\n"
-        f"如果你想让这个节点将流量转发到外部住宅代理/落地代理，请按照严格格式回复：\n"
-        f"<code>IP:端口:账号:密码</code> (例如 <code>1.2.3.4:1080:proxyuser:proxypass</code>)\n\n"
-        f"⚡️ <i>如果不需要中转转发（作为普通服务器落地 SOCKS 直连），请直接回复 <b>0</b></i>",
-        parse_mode="HTML"
-    )
-
-@router.message(XuiSocksFSM.wait_for_upstream)
-async def xui_socks_step3(message: Message, state: FSMContext):
-    text = message.text.strip()
     data = await state.get_data()
-    port = data.get('socks_port')
-    user = data.get('socks_user')
-    pwd = data.get('socks_pwd')
-    instance_id = data.get('socks_instance_id')
+    upstream_str = data.get("reality_upstream", "")
+    instance_id = data.get("reality_instance_id")
     await state.clear()
     
-    up_ip, up_port, up_user, up_pwd = "", "", "", ""
-    is_forwarding = False
-    if text != '0' and ':' in text:
-        try:
-            parts = text.split(':')
-            up_ip, up_port = parts[0], parts[1]
-            if len(parts) >= 4: up_user, up_pwd = parts[2], parts[3]
-            is_forwarding = True
-        except Exception:
-            pass
-            
-    wait_msg = await message.answer(f"⏳ 正在向实例 <code>{instance_id}</code> 底层写入 SOCKS 节点与转发规则...", parse_mode="HTML")
+    wait_msg = await message.answer(f"⏳ 正在为实例 <code>{instance_id}</code> 映射 Apple CDN 证书、配置中转路由并设限 <b>{limit_gb}GB</b>...", parse_mode="HTML")
     
-    # 构建账号 JSON 数据
-    accounts = [{"user": user, "pass": pwd}] if user else []
-    auth_type = "password" if user else "noauth"
-    inbound_settings = {'auth': auth_type, 'accounts': accounts, 'udp': True, 'ip': '0.0.0.0'}
+    port = random.randint(40000, 58000)
+    total_bytes = int(limit_gb * 1024**3) if limit_gb > 0 else 0
     
+    # 构建高阶 Python 注入脚本：生成 X25519、设限、以及自动写入 Xray 出站中转路由
     shell_script = f"""python3 -c "
-import sqlite3, json
+import sqlite3, json, subprocess, uuid, random, os
 port = {port}
-settings = {json.dumps(inbound_settings)}
-stream = {{'network': 'tcp', 'security': 'none'}}
-tag = 'socks-in-{port}'
+total_bytes = {total_bytes}
+upstream_str = '{upstream_str}'
+
+try:
+    xray_bin = subprocess.check_output('find /usr/local/x-ui/bin -name \"xray*\" -type f | head -n 1', shell=True).decode().strip()
+    key_out = subprocess.check_output(f'{{xray_bin}} x25519', shell=True).decode()
+    priv_key, pub_key = '', ''
+    for line in key_out.split('\\n'):
+        if 'Private' in line or 'private' in line: priv_key = line.split(':')[-1].strip()
+        elif 'Public' in line or 'public' in line: pub_key = line.split(':')[-1].strip()
+except Exception:
+    priv_key, pub_key = 'yNu1z_fallback_private_key_replace_me', 'zMu1z_fallback_public_key_replace_me'
+
+client_id = str(uuid.uuid4())
+short_id = ''.join(random.choices('0123456789abcdef', k=8))
+inbound_tag = f'inbound-{{port}}'
+
+settings = {{'clients': [{{'id': client_id, 'flow': 'xtls-rprx-vision', 'email': f'reality_{{port}}'}}], 'decryption': 'none'}}
+stream_settings = {{
+    'network': 'tcp', 'security': 'reality',
+    'realitySettings': {{
+        'show': False, 'dest': 'www.apple.com:443', 'xver': 0,
+        'serverNames': ['www.apple.com', 'apple.com', 'gateway.icloud.com'],
+        'privateKey': priv_key, 'minClientVer': '', 'maxClientVer': '', 'maxTimediff': 0, 'shortIds': [short_id]
+    }}
+}}
 
 conn = sqlite3.connect('/etc/x-ui/x-ui.db')
 c = conn.cursor()
 c.execute('''INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-             VALUES (1, 0, 0, 0, 'SOCKS_Node_{port}', 1, 0, '', ?, 'socks', ?, ?, ?, '{{\"enabled\":true}}')''',
-          (port, json.dumps(settings), json.dumps(stream), tag))
+             VALUES (1, 0, 0, ?, ?, 1, 0, '', ?, 'vless', ?, ?, ?, '{{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"]}}')''',
+          (total_bytes, f'Reality_Apple_{{limit_gb}}G', port, json.dumps(settings), json.dumps(stream_settings), inbound_tag))
+
+# 如果配置了上游中转，智能注入 xrayTemplateConfig 实现出站链绑定
+if upstream_str and ':' in upstream_str:
+    try:
+        parts = upstream_str.split(':')
+        up_ip, up_port = parts[0], int(parts[1])
+        up_user = parts[2] if len(parts) >= 3 else ''
+        up_pass = parts[3] if len(parts) >= 4 else ''
+        outbound_tag = f'outbound-fwd-{{port}}'
+        
+        c.execute(\"SELECT value FROM settings WHERE key='xrayTemplateConfig'\")
+        row = c.fetchone()
+        if row and row[0]:
+            xray_tmpl = json.loads(row[0])
+            new_outbound = {{
+                'tag': outbound_tag, 'protocol': 'socks',
+                'settings': {{'servers': [{{'address': up_ip, 'port': up_port, 'users': [{{'user': up_user, 'pass': up_pass}}] if up_user else []}}]}}
+            }}
+            if 'outbounds' not in xray_tmpl: xray_tmpl['outbounds'] = []
+            xray_tmpl['outbounds'].append(new_outbound)
+            
+            new_rule = {{'type': 'field', 'inboundTag': [inbound_tag], 'outboundTag': outbound_tag}}
+            if 'routing' not in xray_tmpl: xray_tmpl['routing'] = {{'rules': []}}
+            if 'rules' not in xray_tmpl['routing']: xray_tmpl['routing']['rules'] = []
+            xray_tmpl['routing']['rules'].insert(0, new_rule)
+            
+            c.execute(\"UPDATE settings SET value=? WHERE key='xrayTemplateConfig'\", (json.dumps(xray_tmpl),))
+    except Exception as e: print(f'ROUTING_ERR:{{e}}')
+
 conn.commit(); conn.close()
-" && systemctl restart x-ui && echo "ADD_SOCKS_SUCCESS" """
+print(f'REALITY_RES:{{port}}|{{client_id}}|{{pub_key}}|{{short_id}}')
+" && systemctl restart x-ui && echo "ADD_REALITY_SUCCESS" """
 
     try:
         region_id = get_region_by_instance(message.from_user.id, instance_id)
         client = get_ecs_client(region_id)
         req = ecs_models.RunCommandRequest(region_id=region_id, type='RunShellScript', command_content=encode_command(shell_script), instance_id=[instance_id], timeout=60)
-        await asyncio.to_thread(client.run_command, req)
+        resp = await asyncio.to_thread(client.run_command, req)
+        out = await asyncio.to_thread(fetch_command_output_sync, client, region_id, resp.body.invoke_id)
         
+        port_res, client_id, pub_key, short_id = str(port), "未知", "未知", "未知"
+        for line in out.split("\n"):
+            if line.startswith("REALITY_RES:"):
+                try: port_res, client_id, pub_key, short_id = line.split(":", 1)[1].split("|")
+                except Exception: pass
+                
         try:
             ip_resp = client.describe_instances(ecs_models.DescribeInstancesRequest(region_id=region_id, instance_ids=json.dumps([instance_id])))
             pub_ip = ip_resp.body.instances.instance[0].public_ip_address.ip_address[0]
         except Exception:
             pub_ip = "服务器公网IP"
             
-        auth_str = f"{user}:{pwd}@" if user else ""
-        socks_link = f"socks5://{auth_str}{pub_ip}:{port}"
+        vless_link = (
+            f"vless://{client_id}@{pub_ip}:{port_res}?security=reality&encryption=none&pbk={pub_key}"
+            f"&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&sid={short_id}#Apple_CDN_{limit_gb}G"
+        )
         
-        fwd_text = f"🔄 <b>中转转发</b>：<code>{up_ip}:{up_port}</code> (已启用目标路由中转)" if is_forwarding else "⚡️ <b>中转转发</b>：未启用 (纯净服务器 IP 直连落地)"
+        fwd_tip = f"🔄 <b>上游住宅中转</b>：已绑定出口 <code>{upstream_str.split(':')[0]}</code> (底层私密转发)" if upstream_str else "⚡️ <b>落地出口</b>：阿里云原生 BGP 宽带直连"
         
         keyboard = build_xui_keyboard(instance_id, is_running=True)
         await wait_msg.edit_text(
-            f"🎉 <b>SOCKS5 节点创建与配置成功！</b>\n\n"
+            f"🎉 <b>VLESS-Reality 顶级伪装节点创建成功！</b>\n\n"
             f"🖥 <b>物理机实例</b>：<code>{instance_id}</code>\n"
-            f"🔌 <b>节点监听端口</b>：<code>{port}</code>\n"
-            f"👤 <b>鉴权账号/密码</b>：<code>{user or '免密'}</code> / <code>{pwd or '无'}</code>\n"
-            f"{fwd_text}\n\n"
-            f"🔗 <b>一键链接 (支持 Telegram / 指纹浏览器直接导入)：</b>\n"
-            f"<code>{socks_link}</code>\n\n"
-            f"💡 <i>请记得前往阿里云安全组放行 TCP/UDP {port} 端口！</i>",
+            f"🔌 <b>节点监听端口</b>：<code>{port_res}</code> | 📊 <b>流量限额</b>：<b>{limit_gb} GB</b>\n"
+            f"🍎 <b>伪装 SNI</b>：<code>www.apple.com:443</code>\n"
+            f"{fwd_tip}\n\n"
+            f"🚀 <b>一键专属链接 (可直接导入 v2rayN / Shadowrocket / 客户端)：</b>\n"
+            f"<code>{vless_link}</code>\n\n"
+            f"💡 <i>Reality X25519 证书已映射生效，无需购买域名！请去阿里云安全组放行 TCP {port_res} 端口！</i>",
             reply_markup=keyboard, parse_mode="HTML"
         )
     except Exception as e:
-        await wait_msg.edit_text(f"❌ SOCKS 节点创建失败：\n{str(e)}", parse_mode=None)
+        await wait_msg.edit_text(f"❌ 节点创建失败：\n{str(e)}", parse_mode=None)
+
+
+# ================= 🚀 4. FSM：动态修改端口限额 & 流量清零 =================
+@router.message(XuiLimitFSM.wait_for_port)
+async def xui_limit_step1(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit():
+        return await message.answer("❌ 格式错误，请输入纯数字监听端口号 (例如 `48991`):")
+    await state.update_data(target_port=text)
+    await state.set_state(XuiLimitFSM.wait_for_new_limit)
+    await message.answer(
+        f"✅ 已选中待处理端口：<b>{text}</b>\n\n"
+        f"👉 <b>请输入该端口新的【流量限额 (GB)】</b>\n"
+        f"• 如果输入新的额度 (例如 <code>1000</code>)，系统将对该端口重新设限并将<b>已用流量清零</b>！\n"
+        f"• 如果只想将当前流量清零而不改限额，请直接输入原来的额度号；\n"
+        f"• 如果改为不限流量，请回复数字 <code>0</code>。",
+        parse_mode="HTML"
+    )
+
+@router.message(XuiLimitFSM.wait_for_new_limit)
+async def xui_limit_step2(message: Message, state: FSMContext):
+    try:
+        new_limit_gb = float(message.text.strip())
+    except ValueError:
+        return await message.answer("❌ 格式错误，请输入纯数字 (例如 `1000` 或 `0`):")
+        
+    data = await state.get_data()
+    port = data.get("target_port")
+    instance_id = data.get("limit_instance_id")
+    await state.clear()
+    
+    wait_msg = await message.answer(f"⏳ 正在向实例 <code>{instance_id}</code> 底层修改端口 <b>{port}</b> 的流量规则并热重载...", parse_mode="HTML")
+    
+    total_bytes = int(new_limit_gb * 1024**3) if new_limit_gb > 0 else 0
+    
+    shell_script = f"""python3 -c "
+import sqlite3
+conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+c = conn.cursor()
+c.execute('UPDATE inbounds SET total=?, up=0, down=0 WHERE port=?', ({total_bytes}, {port}))
+changes = conn.total_changes
+conn.commit(); conn.close()
+if changes > 0: print('MODIFY_SUCCESS')
+else: print('PORT_NOT_FOUND')
+" && systemctl restart x-ui && echo "LIMIT_DONE" """
+
+    try:
+        region_id = get_region_by_instance(message.from_user.id, instance_id)
+        client = get_ecs_client(region_id)
+        req = ecs_models.RunCommandRequest(region_id=region_id, type='RunShellScript', command_content=encode_command(shell_script), instance_id=[instance_id], timeout=45)
+        resp = await asyncio.to_thread(client.run_command, req)
+        out = await asyncio.to_thread(fetch_command_output_sync, client, region_id, resp.body.invoke_id)
+        
+        keyboard = build_xui_keyboard(instance_id, is_running=True)
+        if "MODIFY_SUCCESS" in out:
+            limit_str = f"<b>{new_limit_gb} GB</b>" if new_limit_gb > 0 else "<b>无限流量 (Unlimited)</b>"
+            await wait_msg.edit_text(
+                f"✅ <b>端口流量规则修改与清零成功！</b>\n\n"
+                f"🖥 <b>物理机实例</b>：<code>{instance_id}</code>\n"
+                f"🔌 <b>操作节点端口</b>：<code>{port}</code>\n"
+                f"📊 <b>新设定总额度</b>：{limit_str}\n"
+                f"🔄 <b>已用流量计数</b>：<b>已归零 (0 MB)</b>\n\n"
+                f"💡 <i>底层服务已完成热重启，该节点的流量监控与超限阻断规则已重新激活！</i>",
+                reply_markup=keyboard, parse_mode="HTML"
+            )
+        elif "PORT_NOT_FOUND" in out:
+            await wait_msg.edit_text(f"⚠️ 操作失败：远程机器数据库中未找到监听端口为 `<code>{port}</code>` 的节点，请核对后重试！", reply_markup=keyboard, parse_mode="HTML")
+        else:
+            await wait_msg.edit_text(f"⚠️ 指令已执行但终端回显异常，请确认端口是否存在。\n回显：{out[:50]}", reply_markup=keyboard)
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ 修改失败：\n{str(e)}", parse_mode=None)

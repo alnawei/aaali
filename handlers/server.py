@@ -6,8 +6,9 @@ import json
 import sqlite3  # 🛠️ 修正 1：补充遗漏的 sqlite3 模块导入，防止底层删机改库时报 NameError
 import resend
 import config
+import glob
 import db  # 导入本地账本
-
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from alibabacloud_cms20190101.client import Client as CmsClient
 from alibabacloud_cms20190101 import models as cms_models
 from datetime import datetime
@@ -15,7 +16,6 @@ from dateutil.relativedelta import relativedelta
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # 阿里云 SDK 依赖
@@ -34,31 +34,37 @@ class ServerManagement(StatesGroup):
 # ================= 1. 底层 API 与发信函数 =================
 def get_template_id(region_id: str) -> str:
     """
-    智能模板读取机制：
-    1. 优先：连接 SQLite 数据库，实时查询在 Telegram 【启动模板管理】 UI 中最新保存的模板 ID
-    2. 兜底：如果数据库没找到或未填，才去读取 .env 文件中的 TPL_XXX
+    ⚡️ 100% 精准锁定：从 bot_data.db 的 launch_templates 表实时抓取启动模板
+    彻底斩断对 .env 假占位符的任何依赖！
     """
-    import sqlite3
-    try:
-        db_path = getattr(config, 'DB_PATH', '/srv/aali/mg_core.db')
-        conn = sqlite3.connect(db_path, timeout=3.0)
-        cursor = conn.cursor()
-        key_1 = f"tpl_{region_id.lower()}"
-        key_2 = f"TPL_{region_id.replace('-', '_').upper()}"
-        for table_name in ["mg_settings", "settings", "launch_templates"]:
-            try:
-                cursor.execute(f"SELECT value FROM {table_name} WHERE key IN (?, ?) LIMIT 1", (key_1, key_2))
-                row = cursor.fetchone()
-                if row and row[0] and "xxxx" not in row[0]:
-                    conn.close()
-                    return row[0].strip()
-            except Exception:
-                continue
-        conn.close()
-    except Exception:
-        pass
-    env_var_name = f"TPL_{region_id.replace('-', '_').upper()}"
-    return os.getenv(env_var_name, "").strip()
+    # 1. 把真正的目标数据库 bot_data.db 放在第一优先级
+    candidate_dbs = ['/srv/aali/bot_data.db']
+    if hasattr(config, 'DB_PATH') and config.DB_PATH not in candidate_dbs:
+        candidate_dbs.append(config.DB_PATH)
+    candidate_dbs.extend(glob.glob('/srv/aali/*.db'))
+
+    # 2. 遍历查找真实启动模板 ID
+    for db_file in candidate_dbs:
+        if not os.path.exists(db_file):
+            continue
+        try:
+            conn = sqlite3.connect(db_file, timeout=3.0)
+            cursor = conn.cursor()
+            # 针对你刚才抓出来的数据结构：('cn-hongkong', '中国香港', 'lt-j6c...')
+            cursor.execute("SELECT * FROM launch_templates")
+            for row in cursor.fetchall():
+                # 只要当前这一组数据中包含我们要开机的地域 (比如 cn-hongkong)
+                if any(region_id.lower() == str(col).lower() for col in row):
+                    for col in row:
+                        if isinstance(col, str) and col.strip().startswith("lt-") and "xxxx" not in col:
+                            conn.close()
+                            return col.strip() # ⭐ 极速成功返回：lt-j6c2z7laetgycqgdtrcz
+            conn.close()
+        except Exception:
+            continue
+
+    # 3. 如果未配置，直接抛错阻断，绝对不再给阿里云发送假占位符 ID！
+    raise ValueError(f"提示：未在系统数据库中找到 [{region_id}] 的启动模板 ID！请在面板的「启动模板管理」中重新添加。")
 
 # 初始化 Resend
 resend.api_key = config.RESEND_API_KEY  # 记得去 config.py 里把这个变量读出来
@@ -330,26 +336,34 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
     template_id = get_template_id(region_id)
     
     if not template_id:
-        return await callback.message.edit_text(f"⚠️ 暂未在 `.env` 中配置 `{region_id}` 对应的启动模板 (TPL_xxx)，请配置后重试。")
-    
+        return await callback.message.edit_text(f"⚠️ 暂未在系统或 `.env` 中配置 `{region_id}` 对应的启动模板，请配置后重试。")
+        
     await state.clear()
     progress_msg = await callback.message.edit_text(f"🚀 已拦截指令。正在向阿里云 `{region_id}` 下发创建任务，请耐心等待 (约需20-40秒)...")
     
     result = await asyncio.to_thread(create_ecs_instance_sync, region_id, template_id)
     
     if result["success"]:
+        # 1. 提取实例 ID 并构造一键直达“节点配置第二步”的悬浮内联按钮
+        inst_id = result['instance_id']
+        node_config_btn = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="⚙️ 节点配置 (选脚本)", callback_data=f"srv_sel:{inst_id}")]
+        ])
+        
+        # 2. 组装文案
         text = (
             f"🎉 **MG 控制台扩容成功！**\n\n"
-            f"🌍 **地域**: `{region_id}`\n"
-            f"🆔 **实例 ID**: `{result['instance_id']}`\n"
+            f"🌏 **地域**: `{region_id}`\n"
+            f"🆔 **实例 ID**: `{inst_id}`\n"
             f"🌐 **公网 IP**: `{result['ip']}`\n"
             f"✅ **状态**: 运行中\n\n"
             f"安全组与计费模式已按模板自动下发。"
         )
-        await progress_msg.edit_text(text, parse_mode="Markdown")
+        # 3. 将悬浮按钮直接挂载到最终成功提示的消息底部！
+        await progress_msg.edit_text(text, parse_mode="Markdown", reply_markup=node_config_btn)
     else:
         await progress_msg.edit_text(f"❌ **创建失败**\n\n原因: {result.get('error')}", parse_mode="Markdown")
-
+        
     await callback.answer()
 
 

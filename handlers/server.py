@@ -69,7 +69,7 @@ def create_ecs_instance_sync(region_id: str, template_id: str) -> dict:
         run_request = ecs_models.RunInstancesRequest(
             region_id=region_id,
             launch_template_id=template_id,
-            amount=1
+            amount=1,
             password="@QS00008"
         )
         run_response = client.run_instances(run_request)

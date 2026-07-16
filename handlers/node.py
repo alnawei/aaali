@@ -23,10 +23,7 @@ def get_servers_data(user_id: int):
         servers = []
 
     if not servers:
-        servers = [
-            {"instance_id": "i-testVirtualServerHK001", "name": "虚拟测试节点-香港", "region": "cn-hongkong", "ip": "47.242.11.22"},
-            {"instance_id": "i-testVirtualServerJP002", "name": "虚拟测试节点-东京", "region": "ap-northeast-1", "ip": "8.213.33.44"}
-        ]
+        return []
     return servers
 
 def build_servers_keyboard(user_id: int) -> InlineKeyboardMarkup:

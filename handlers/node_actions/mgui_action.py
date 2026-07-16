@@ -14,7 +14,7 @@ from db import get_active_servers
 
 router = Router()
 
-# ================= 🛠️ 独立绑定 Bot 凭证状态机 (备用) =================
+# ================= 🛠️ 特殊专属 Bot 手动绑定状态机 =================
 class MguiBindBotFSM(StatesGroup):
     wait_for_token = State()
     wait_for_admin = State()
@@ -67,12 +67,13 @@ def build_mgui_keyboard(instance_id: str, is_running: bool = True) -> InlineKeyb
     builder = [
         [InlineKeyboardButton(text="🔍 实时探测状态 & 查看登录账号密码", callback_data=f"mgui_cmd:check:{instance_id}")],
         [
-            InlineKeyboardButton(text="🟢 一键部署/重装 (含自动绑定Bot)", callback_data=f"mgui_cmd:install:{instance_id}"),
+            InlineKeyboardButton(text="🟢 一键部署/重装 (全自动绑定默认Bot)", callback_data=f"mgui_cmd:install:{instance_id}"),
             InlineKeyboardButton(text="🔄 更新面板到最新版", callback_data=f"mgui_cmd:update:{instance_id}")
         ],
         [
             toggle_btn,
-            InlineKeyboardButton(text="🤖 修改/重新绑定 Bot", callback_data=f"mgui_cmd:bind_bot:{instance_id}")
+            # ⭐ 核心升级：引导至分流菜单，默认不打字，特殊才手动
+            InlineKeyboardButton(text="🤖 修改/绑定监控 Bot", callback_data=f"mgui_cmd:bind_menu:{instance_id}")
         ],
         [
             InlineKeyboardButton(text="🔑 随机重置登录密码", callback_data=f"mgui_cmd:reset_pass:{instance_id}"),
@@ -83,7 +84,7 @@ def build_mgui_keyboard(instance_id: str, is_running: bool = True) -> InlineKeyb
     return InlineKeyboardMarkup(inline_keyboard=builder)
 
 
-# ================= 🚀 1. 渲染 MG-UI 初始化交付面板 =================
+# ================= 🚀 1. 渲染 MG-UI 初始化交付主面板 =================
 @router.callback_query(F.data.startswith("run_sh:mgui:"))
 async def show_mgui_panel(call: CallbackQuery):
     try:
@@ -98,16 +99,16 @@ async def show_mgui_panel(call: CallbackQuery):
         f"🖥 <b>操作物理机</b>：<code>{instance_id}</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🌐 <b>默认监听端口</b>：<code>8888</code>\n"
-        f"💡 <b>初始化交付说明</b>：\n"
-        f"• <b>一键交付</b>：点击「🟢 一键部署/重装」，系统将自动安装面板并<b>无感注入当前设置好的 Bot 凭证</b>。\n"
-        f"• <b>业务运维</b>：本控制台仅负责环境交付与启停控制；节点与端口配置请登录 Web 后台或专用 Bot 操作。\n\n"
+        f"💡 <b>自动化交付流水线说明</b>：\n"
+        f"• <b>一键交付</b>：点击「🟢 一键部署/重装」，系统不仅会自动拉取安装 Shell 脚本，还会<b>直接把当前的默认主控 Bot 凭证注入底层并激活监控</b>！\n"
+        f"• <b>灵活绑定</b>：点击「🤖 修改/绑定」，可极速一键重置默认绑定，或在特殊场景下为该机单独设置自定义密钥。\n\n"
         f"👇 <b>请选择要向该阿里云机器下发的初始化指令：</b>"
     )
     await call.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await call.answer()
 
 
-# ================= 🚀 2. 接收并自动化下发初始化脚本 =================
+# ================= 🚀 2. 接收基础运维与分流控制指令 =================
 @router.callback_query(F.data.startswith("mgui_cmd:"))
 async def execute_mgui_command(call: CallbackQuery, state: FSMContext):
     try:
@@ -118,13 +119,33 @@ async def execute_mgui_command(call: CallbackQuery, state: FSMContext):
     if "testVirtualServer" in instance_id:
         return await call.answer(f"UI 测试模式：已模拟向 MG-UI 执行【{action}】！", show_alert=True)
 
-    if action == "bind_bot":
+    # 🛑 分流拦截点：点击【绑定/修改 Bot】，弹出两级智能选择菜单
+    if action == "bind_menu":
+        menu_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡️ 一键重新注入默认主控 Bot (免输入)", callback_data=f"mgui_cmd:bind_default:{instance_id}")],
+            [InlineKeyboardButton(text="✏️ 特殊情况：手动填写特殊专属 Bot", callback_data=f"mgui_cmd:bind_custom:{instance_id}")],
+            [InlineKeyboardButton(text="🔙 返回面板控制台", callback_data=f"run_sh:mgui:{instance_id}")]
+        ])
+        await call.message.edit_text(
+            f"🤖 <b>监控预警 Bot 绑定管理</b>\n\n"
+            f"🖥 <b>物理机实例</b>：<code>{instance_id}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"系统默认已在你在【一键部署】时自动绑定了主控 Bot，无需重复设置。\n\n"
+            f"👉 <b>请选择您的特殊配置需求：</b>\n"
+            f"• <b>默认主控 Bot</b>：全网服务器共用一个管家快速报警，无需额外打字。\n"
+            f"• <b>特殊独立 Bot</b>：当你要将此机交付给特定客户，或想用独立的 Bot 接收推送时选用。",
+            reply_markup=menu_kb, parse_mode="HTML"
+        )
+        return await call.answer()
+
+    # 🛑 特殊场景分流：进入 FSM 手动文本输入框
+    if action == "bind_custom":
         await state.update_data(bind_instance_id=instance_id)
         await state.set_state(MguiBindBotFSM.wait_for_token)
         await call.message.answer(
-            f"🤖 <b>为该机器重新配置监控 Bot 凭证</b>\n\n"
-            f"👉 请回复需要注入该机器底层数据库的 <b>Bot Token</b>：\n\n"
-            f"<i>(回复 0 则直接使用当前中控默认配置；发送 /cancel 取消)</i>",
+            f"✏️ <b>手动配置特殊独立 Bot 凭证</b>\n\n"
+            f"👉 请回复你要注入该服务器底层数据库的 <b>专属 Bot Token</b>：\n\n"
+            f"<i>(如需放弃并使用主控默认，请回复 0；发送 /cancel 取消)</i>",
             parse_mode="HTML"
         )
         return await call.answer()
@@ -163,7 +184,7 @@ print(f'PORT={port}')
 print(f'BOUND={bot_bound}')
 " """
     elif action == "install":
-        # ⭐ 核心逻辑：执行 GitHub 安装脚本后，立刻无感把 BOT_TOKEN 和 ADMIN_ID 写入数据库并拉起服务！
+        # ⭐ 核心杀手锏：一键安装 Shell 完毕后，自动用当前的默认 Token 注入 SQLite 并开启服务！
         shell_script = f"""
 bash <(curl -sL https://raw.githubusercontent.com/alnawei/sh/main/MG-UI/install.sh) &&
 python3 -c "
@@ -177,6 +198,20 @@ try:
     conn.commit()
     conn.close()
 except: pass" && systemctl restart mg-bot && echo "INSTALL_AND_BIND_SUCCESS"
+        """
+    elif action == "bind_default":
+        # ⭐ 快捷操作：直接将当前默认的主控凭证强制重置注入，1秒极速恢复！
+        shell_script = f"""python3 -c "
+import sqlite3
+try:
+    conn = sqlite3.connect('/root/mg_core.db')
+    c = conn.cursor()
+    c.execute('CREATE TABLE IF NOT EXISTS mg_settings (key TEXT PRIMARY KEY, value TEXT)')
+    c.execute('REPLACE INTO mg_settings (key, value) VALUES (?, ?)', ('bot_token', '{config.BOT_TOKEN}'))
+    c.execute('REPLACE INTO mg_settings (key, value) VALUES (?, ?)', ('admin_id', '{config.ADMIN_ID}'))
+    conn.commit()
+    conn.close()
+except: pass" && systemctl restart mg-bot && echo "BIND_DEFAULT_SUCCESS"
         """
     elif action == "update":
         shell_script = "bash <(curl -sL https://raw.githubusercontent.com/alnawei/sh/main/MG-UI/update.sh)"
@@ -232,7 +267,7 @@ echo "NEW_PASS=$NEW_PASS"
                 f"👤 <b>面板登录账号</b>：<code>{data_map.get('USER', '未知')}</code>\n"
                 f"🔑 <b>面板登录密码</b>：<code>{data_map.get('PASS', '未知')}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"💡 <i>提示：该服务器环境已交付，你可以直接在浏览器输入 http://实例公网IP:端口 登录后台操作！</i>",
+                f"💡 <i>提示：复制上方凭证，在浏览器访问 http://实例公网IP:端口 即可登录 Web 后台！</i>",
                 reply_markup=keyboard, parse_mode="HTML"
             )
         elif action == "reset_pass":
@@ -255,10 +290,19 @@ echo "NEW_PASS=$NEW_PASS"
                 f"✅ <b>面板服务已成功{status_word}！</b>\n\n🖥 实例ID：<code>{instance_id}</code>",
                 reply_markup=keyboard, parse_mode="HTML"
             )
+        elif action == "bind_default":
+            keyboard = build_mgui_keyboard(instance_id, is_running=True)
+            await call.message.edit_text(
+                f"⚡️ <b>已成功注入默认主控 Bot！</b>\n\n"
+                f"🖥 <b>物理机实例</b>：<code>{instance_id}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"✅ 系统已自动将当前主控制台预设的 Token 和 AdminID 强制覆写到机器底层，并重新拉起雷达监听服务！",
+                reply_markup=keyboard, parse_mode="HTML"
+            )
         else:
             keyboard = build_mgui_keyboard(instance_id, is_running=True)
             await call.message.edit_text(
-                f"✅ <b>指令下发成功！</b>\n\n🖥 实例ID：<code>{instance_id}</code>\n⏳ <b>执行动作</b>：初始化自动交付与部署 ({action})\n\n任务将在服务器后台自动执行完结（约需40秒），完成后将自动完成 Bot 凭证绑定！",
+                f"✅ <b>指令下发成功！</b>\n\n🖥 实例ID：<code>{instance_id}</code>\n⏳ <b>执行动作</b>：一键自动化运维 ({action})\n\n任务已在后台执行（约需40秒），完成后系统会自动完成并启动默认监控 Bot！",
                 reply_markup=keyboard, parse_mode="HTML"
             )
     except Exception as e:
@@ -267,14 +311,14 @@ echo "NEW_PASS=$NEW_PASS"
         await call.answer()
 
 
-# ================= 🚀 3. 手动修改/绑定 Bot 凭证状态机 (备用) =================
+# ================= 🚀 3. 特殊场景：FSM 手动输入独立专属 Bot =================
 @router.message(MguiBindBotFSM.wait_for_token)
 async def mgui_bind_token(message: Message, state: FSMContext):
     token = message.text.strip()
     if token == '0': token = config.BOT_TOKEN
     await state.update_data(bot_token=token)
     await state.set_state(MguiBindBotFSM.wait_for_admin)
-    await message.answer("👤 <b>请输入接收该节点报警的 Admin ID：</b>\n<i>(回复 0 使用当前默认 Admin ID)</i>", parse_mode="HTML")
+    await message.answer("👤 <b>请输入接收该特殊节点告警的 Admin ID：</b>\n<i>(回复 0 将使用当前主控默认 Admin ID)</i>", parse_mode="HTML")
 
 @router.message(MguiBindBotFSM.wait_for_admin)
 async def mgui_bind_admin(message: Message, state: FSMContext):
@@ -286,7 +330,7 @@ async def mgui_bind_admin(message: Message, state: FSMContext):
     instance_id = data.get('bind_instance_id')
     await state.clear()
     
-    wait_msg = await message.answer("⏳ 正在向该机器底层注入 Bot 凭证并启动守护进程...")
+    wait_msg = await message.answer("⏳ 正在向远程服务器底层覆写您输入的独立 Bot 凭证并重启服务...")
     shell_script = f"""python3 -c "
 import sqlite3
 try:
@@ -296,7 +340,7 @@ try:
     c.execute('REPLACE INTO mg_settings (key, value) VALUES (?, ?)', ('bot_token', '{token}'))
     c.execute('REPLACE INTO mg_settings (key, value) VALUES (?, ?)', ('admin_id', '{admin_id}'))
     conn.commit(); conn.close()
-except: pass" && systemctl restart mg-bot && echo "BIND_SUCCESS" """
+except: pass" && systemctl restart mg-bot && echo "BIND_CUSTOM_SUCCESS" """
     
     try:
         region_id = get_region_by_instance(message.from_user.id, instance_id)
@@ -306,12 +350,12 @@ except: pass" && systemctl restart mg-bot && echo "BIND_SUCCESS" """
         out = await asyncio.to_thread(fetch_command_output_sync, client, region_id, resp.body.invoke_id)
         keyboard = build_mgui_keyboard(instance_id, is_running=True)
         
-        if "BIND_SUCCESS" in out:
+        if "BIND_CUSTOM_SUCCESS" in out:
             await wait_msg.edit_text(
-                f"🤖 <b>Bot 凭证绑定成功！</b>\n\n"
+                f"🤖 <b>特殊独立 Bot 凭证绑定成功！</b>\n\n"
                 f"🖥 <b>机器实例</b>：<code>{instance_id}</code>\n"
-                f"🔑 <b>绑定Token</b>：<code>{token[:10]}...</code>\n"
-                f"✅ 机器已自动拉起后台进程，监控已就绪！",
+                f"🔑 <b>专属Token</b>：<code>{token[:10]}...</code>\n"
+                f"✅ 该服务器现已彻底剥离默认主控监听，改用您指定的独立管家推送消息！",
                 reply_markup=keyboard, parse_mode="HTML"
             )
         else:

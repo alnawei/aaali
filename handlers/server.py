@@ -33,7 +33,30 @@ class ServerManagement(StatesGroup):
 
 # ================= 1. 底层 API 与发信函数 =================
 def get_template_id(region_id: str) -> str:
-    """根据 region_id 动态读取环境变量中的启动模板 ID"""
+    """
+    智能模板读取机制：
+    1. 优先：连接 SQLite 数据库，实时查询在 Telegram 【启动模板管理】 UI 中最新保存的模板 ID
+    2. 兜底：如果数据库没找到或未填，才去读取 .env 文件中的 TPL_XXX
+    """
+    import sqlite3
+    try:
+        db_path = getattr(config, 'DB_PATH', '/srv/aali/mg_core.db')
+        conn = sqlite3.connect(db_path, timeout=3.0)
+        cursor = conn.cursor()
+        key_1 = f"tpl_{region_id.lower()}"
+        key_2 = f"TPL_{region_id.replace('-', '_').upper()}"
+        for table_name in ["mg_settings", "settings", "launch_templates"]:
+            try:
+                cursor.execute(f"SELECT value FROM {table_name} WHERE key IN (?, ?) LIMIT 1", (key_1, key_2))
+                row = cursor.fetchone()
+                if row and row[0] and "xxxx" not in row[0]:
+                    conn.close()
+                    return row[0].strip()
+            except Exception:
+                continue
+        conn.close()
+    except Exception:
+        pass
     env_var_name = f"TPL_{region_id.replace('-', '_').upper()}"
     return os.getenv(env_var_name, "").strip()
 

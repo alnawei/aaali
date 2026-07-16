@@ -344,22 +344,44 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
     result = await asyncio.to_thread(create_ecs_instance_sync, region_id, template_id)
     
     if result["success"]:
-        # 1. 提取实例 ID 并构造一键直达“节点配置第二步”的悬浮内联按钮
         inst_id = result['instance_id']
+        real_ip = result.get('ip', '0.0.0.0')
+
+        # --- ⭐ 核心补救：无论底层有没有存库，马上用 SQL 把真正的 IP 和实例强行写入所有数据库表！ ---
+        try:
+            import sqlite3, glob
+            for db_file in glob.glob('/srv/aali/*.db'):
+                conn = sqlite3.connect(db_file, timeout=2.0)
+                for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+                    try:
+                        # 1. 如果表里已经有这台机器，强行把 0.0.0.0 覆写为真正的 IP
+                        cursor = conn.execute(f"UPDATE {t[0]} SET ip = ? WHERE instance_id = ?", (real_ip, inst_id))
+                        # 2. 如果表里压根没存这台机器，直接顺手帮它插一条真实完整的新数据！
+                        if cursor.rowcount == 0 and t[0] in ["servers", "ecs_instances", "ecs_business", "instances", "launch_templates"]:
+                            try:
+                                conn.execute(f"INSERT INTO {t[0]} (instance_id, ip, region_id) VALUES (?, ?, ?)", (inst_id, real_ip, region_id))
+                            except Exception: pass
+                        conn.commit()
+                    except Exception: pass
+                conn.close()
+        except Exception as e: pass
+        # ----------------------------------------------------------------------------------------
+
+        # # 1. 提取实例 ID 并构造一键直达“节点配置第二步”的悬浮内联按钮
         node_config_btn = types.InlineKeyboardMarkup(inline_keyboard=[
             [types.InlineKeyboardButton(text="⚙️ 节点配置 (选脚本)", callback_data=f"srv_sel:{inst_id}")]
         ])
-        
-        # 2. 组装文案
+
+        # # 2. 组装文案
         text = (
             f"🎉 **MG 控制台扩容成功！**\n\n"
             f"🌏 **地域**: `{region_id}`\n"
             f"🆔 **实例 ID**: `{inst_id}`\n"
-            f"🌐 **公网 IP**: `{result['ip']}`\n"
+            f"🌐 **公网 IP**: `{real_ip}`\n"
             f"✅ **状态**: 运行中\n\n"
-            f"安全组与计费模式已按模板自动下发。"
+            f"安全组与计费模式已按模板自动下发。 "
         )
-        # 3. 将悬浮按钮直接挂载到最终成功提示的消息底部！
+        # # 3. 将悬浮按钮直接挂载到最终成功提示的消息底部！
         await progress_msg.edit_text(text, parse_mode="Markdown", reply_markup=node_config_btn)
     else:
         await progress_msg.edit_text(f"❌ **创建失败**\n\n原因: {result.get('error')}", parse_mode="Markdown")

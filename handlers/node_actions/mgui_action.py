@@ -27,6 +27,8 @@ CACHE_TTL_SECONDS = 300
 class MguiBindBotFSM(StatesGroup):
     wait_for_custom_token = State()
     wait_for_custom_admin = State()
+
+class MguiPortFSM(StatesGroup):
     wait_for_custom_secret = State()
     wait_for_ad_tag = State()
 
@@ -443,8 +445,15 @@ echo 'RAND_SEC_OK'
 """
         await execute_xui_hybrid(instance_id, call.from_user.id, script)
         await call.answer(f"✅ 端口 {port} 的密钥已随机更换并重启！", show_alert=True)
-        # 将键盘跳回获取链接状态，方便用户直接复制新链接
-        return await execute_mg_command(call, state)  # 如果报错，可以直接改回 pass 或引导返回
+        
+        # 修复：取消死循环，改为显示成功提示并提供返回按钮
+        return await call.message.edit_text(
+            f"✅ <b>密钥重置成功！</b>\n\n端口 <code>{port}</code> 的密钥已随机更换。\n👉 请点击下方按钮返回控制台，重新获取最新链接。",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"🔙 返回端口 {port} 管控台", callback_data=f"mg_cmd:port_ctrl-{port}:{instance_id}")]
+            ]),
+            parse_mode="HTML"
+        )
 
     # --- 新增：更换指定密钥 ---
     if action.startswith("port_cust_sec-"):

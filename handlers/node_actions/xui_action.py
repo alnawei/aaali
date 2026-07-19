@@ -12,9 +12,9 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from alibabacloud_ecs20140526.client import Client as EcsClient
-from alibabacloud_ecs20140526 import models as ecs_models
-from alibabacloud_tea_openapi import models as open_api_models
+# from alibabacloud_ecs20140526.client import Client as EcsClient
+# from alibabacloud_ecs20140526 import models as ecs_models
+# from alibabacloud_tea_openapi import models as open_api_models
 
 import config
 from db import get_active_servers
@@ -29,27 +29,27 @@ CACHE_TTL_SECONDS = 300
 class XuiRouteFSM(StatesGroup):
     wait_for_upstream = State()
 
-# ================= 🛠️ 底层客户端与双引擎工具 =================
-def get_ecs_client(region_id: str) -> EcsClient:
-    config_model = open_api_models.Config(
-        access_key_id=config.ALIYUN_ACCESS_KEY_ID,      
-        access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET 
-    )
-    config_model.endpoint = f'ecs.{region_id}.aliyuncs.com'
-    return EcsClient(config_model)
+# # ================= 🛠️ 底层客户端与双引擎工具 =================
+# def get_ecs_client(region_id: str) -> EcsClient:
+#     config_model = open_api_models.Config(
+#         access_key_id=config.ALIYUN_ACCESS_KEY_ID,      
+#         access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET 
+#     )
+#     config_model.endpoint = f'ecs.{region_id}.aliyuncs.com'
+#     return EcsClient(config_model)
 
-def encode_command(command: str) -> str:
-    return base64.b64encode(command.encode('utf-8')).decode('utf-8')
+# def encode_command(command: str) -> str:
+#     return base64.b64encode(command.encode('utf-8')).decode('utf-8')
 
-def get_region_by_instance(user_id: int, instance_id: str) -> str:
-    try:
-        servers = get_active_servers(user_id)
-        for srv in servers:
-            if srv["instance_id"] == instance_id:
-                return srv["region"]
-    except Exception:
-        pass
-    return "cn-hongkong"
+# def get_region_by_instance(user_id: int, instance_id: str) -> str:
+#     try:
+#         servers = get_active_servers(user_id)
+#         for srv in servers:
+#             if srv["instance_id"] == instance_id:
+#                 return srv["region"]
+#     except Exception:
+#         pass
+#     return "cn-hongkong"
 
 def get_server_ip(instance_id: str) -> str:
     try:
@@ -70,57 +70,88 @@ def get_server_ip(instance_id: str) -> str:
         pass
     return ""
 
-async def fetch_command_output_async(client: EcsClient, region_id: str, invoke_id: str) -> str:
-    req = ecs_models.DescribeInvocationResultsRequest(region_id=region_id, invoke_id=invoke_id)
-    # 🌟 修复：增加轮询次数到 15 次 (30秒)，给服务器重启面板留足时间
-    for _ in range(15):
-        await asyncio.sleep(2.0)
-        try:
-            resp = await asyncio.to_thread(client.describe_invocation_results, req)
-            if resp.body.invocation and resp.body.invocation.invocation_results.invocation_result:
-                res = resp.body.invocation.invocation_results.invocation_result[0]
-                if res.invocation_state in ["Success", "Failed", "Finished"]:
-                    output_b64 = res.output or ""
-                    return base64.b64decode(output_b64).decode('utf-8', errors='ignore').strip() if output_b64 else "SUCCESS"
-        except Exception:
-            continue
-    return "⏳底层执行超时_TIMEOUT"
+
+def get_server_password(instance_id: str) -> str:
+    """从本地数据库获取手动添加的服务器密码"""
+    try:
+        db_path = getattr(config, 'DB_PATH', '/srv/aali/bot_data.db')
+        conn = sqlite3.connect(db_path, timeout=4.0)
+        cursor = conn.cursor()
+        # 遍历可能存储服务器信息的表，寻找密码字段
+        for table in ["ecs_business", "servers", "ecs_instances", "instances"]:
+            try:
+                # 尝试读取 password 字段
+                cursor.execute(f"SELECT password FROM {table} WHERE instance_id = ? LIMIT 1", (instance_id,))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    conn.close()
+                    return row[0].strip()
+            except Exception:
+                continue
+        conn.close()
+    except Exception:
+        pass
+    return ""
+# async def fetch_command_output_async(client: EcsClient, region_id: str, invoke_id: str) -> str:
+#     req = ecs_models.DescribeInvocationResultsRequest(region_id=region_id, invoke_id=invoke_id)
+#     # 🌟 修复：增加轮询次数到 15 次 (30秒)，给服务器重启面板留足时间
+#     for _ in range(15):
+#         await asyncio.sleep(2.0)
+#         try:
+#             resp = await asyncio.to_thread(client.describe_invocation_results, req)
+#             if resp.body.invocation and resp.body.invocation.invocation_results.invocation_result:
+#                 res = resp.body.invocation.invocation_results.invocation_result[0]
+#                 if res.invocation_state in ["Success", "Failed", "Finished"]:
+#                     output_b64 = res.output or ""
+#                     return base64.b64decode(output_b64).decode('utf-8', errors='ignore').strip() if output_b64 else "SUCCESS"
+#         except Exception:
+#             continue
+#     return "⏳底层执行超时_TIMEOUT"
 
 async def execute_xui_hybrid(instance_id: str, user_id: int, shell_script: str) -> str:
-    """双引擎智能路由执行器"""
-    region_id = get_region_by_instance(user_id, instance_id)
-    try:
-        client = get_ecs_client(region_id)
-        request = ecs_models.RunCommandRequest(
-            region_id=region_id, type='RunShellScript', command_content=encode_command(shell_script),
-            instance_id=[instance_id], name=f"MG_XUI_HYBRID", timeout=180
-        )
-        response = await asyncio.to_thread(client.run_command, request)
-        return await fetch_command_output_async(client, region_id, response.body.invoke_id)
-    except Exception as e:
-        if "InvalidInstance.NotFound" not in str(e) and "InstanceNotExists" not in str(e):
-            raise Exception(f"SDK 调用异常: {str(e)}")
-            
+    """极速单轨 SSH 执行器 (智能区分密码来源)"""
+    
+    # 1. 统一获取机器的公网 IP
     ip = get_server_ip(instance_id)
-    if not ip: raise Exception("智能路由失败：SDK 未找到实例，且本地数据库未匹配公网 IP。")
+    if not ip: 
+        raise Exception("智能路由失败：无法在本地数据库中找到该实例的公网 IP。")
         
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
+        
+        # ================== 🌟 核心修改区域 ==================
+        # 2. 智能判断密码来源
+        if instance_id.startswith("i-"):
+            # 阿里云 API 自动开出的机器：使用预设的固定密码
+            pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
+        else:
+            # 手动添加的机器：去数据库查它自己的专属密码
+            pwd = get_server_password(instance_id)
+            if not pwd:
+                raise Exception("无法在数据库中读取到该手动实例的 SSH 密码，请检查服务器配置。")
+        # ===================================================
+        
+        # 3. 闪电建立 SSH 握手 (连接超时限制在 8 秒内)
         await asyncio.to_thread(client.connect, hostname=ip, port=22, username="root", password=pwd, timeout=8.0)
-        stdin, stdout, stderr = await asyncio.to_thread(client.exec_command, shell_script, timeout=60.0)
         
-        # 🌟 核心防卡死：强制给 SSH 读写通道加上物理超时！
-        stdout.channel.settimeout(60.0)
-        stderr.channel.settimeout(60.0)
+        # 4. 执行指令 (给予充足的 180 秒执行时间)
+        stdin, stdout, stderr = await asyncio.to_thread(client.exec_command, shell_script, timeout=180.0)
         
+        # 🌟 物理通道防卡死：强制让 SSH 的数据流读取等待也放宽到 180 秒，保护下载安装等慢动作
+        stdout.channel.settimeout(180.0)
+        stderr.channel.settimeout(180.0)
+        
+        # 5. 瞬间拉取执行结果
         out_str = (await asyncio.to_thread(stdout.read)).decode('utf-8').strip()
         err_str = (await asyncio.to_thread(stderr.read)).decode('utf-8').strip()
         client.close()
+        
+        # 合并标准输出与错误输出，若为空则返回 SUCCESS
         return (out_str + "\n" + err_str).strip() or "SUCCESS"
+        
     except Exception as e:
-        raise Exception(f"SSH 降级执行失败: {str(e)}")
+        raise Exception(f"SSH 极速通道执行失败: {str(e)}")
 
 
 # ================= 🎨 动态 UI 键盘渲染 =================
@@ -305,7 +336,7 @@ print('REALITY_RES:{port}|' + client_id + '|' + pub_key + '|' + short_id)
 " && systemctl restart x-ui
 """
         try:
-            out = await asyncio.wait_for(execute_xui_hybrid(instance_id, call.from_user.id, shell_script), timeout=60.0)
+            out = await asyncio.wait_for(execute_xui_hybrid(instance_id, call.from_user.id, shell_script), timeout=180.0)
             if "REALITY_RES:" not in out: raise Exception(f"数据库写入异常，回显截取: {out[:80]}")
                 
             port_res, client_id, pub_key, short_id = str(port), "", "", ""
@@ -603,7 +634,7 @@ print('ROUTE_OK')
 " && systemctl restart x-ui """
 
     try:
-        out = await asyncio.wait_for(execute_xui_hybrid(instance_id, message.from_user.id, shell_script), timeout=45.0)
+        out = await asyncio.wait_for(execute_xui_hybrid(instance_id, message.from_user.id, shell_script), timeout=180.0)
         if "ROUTE_OK" in out:
             # 解析测试结果并去除多余回显
             test_info = "未知状态"

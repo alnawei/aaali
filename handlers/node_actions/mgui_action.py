@@ -14,6 +14,7 @@ from alibabacloud_ecs20140526.client import Client as EcsClient
 from alibabacloud_ecs20140526 import models as ecs_models
 from alibabacloud_tea_openapi import models as open_api_models
 
+
 import config
 from db import get_active_servers
 
@@ -31,6 +32,11 @@ class MguiBindBotFSM(StatesGroup):
 class MguiPortFSM(StatesGroup):
     wait_for_custom_secret = State()
     wait_for_ad_tag = State()
+
+class MguiCustomNodeFSM(StatesGroup):
+    wait_for_port = State()
+    wait_for_pwd = State()
+    wait_for_traffic = State()
 
 # ================= 🛠️ 底层客户端与双引擎工具 =================
 def get_ecs_client(region_id: str) -> EcsClient:
@@ -120,7 +126,8 @@ async def execute_xui_hybrid(instance_id: str, user_id: int, shell_script: str) 
             client = get_ecs_client(region_id)
             request = ecs_models.RunCommandRequest(
                 region_id=region_id, type='RunShellScript', command_content=encode_command(shell_script),
-                instance_id=[instance_id], name=f"MG_XUI_HYBRID", timeout=60
+                instance_id=[instance_id], name=f"MG_XUI_HYBRID", 
+                timeout=120  # 阿里云 SDK 端也放宽到 120 秒
             )
             response = await asyncio.to_thread(client.run_command, request)
             return await fetch_command_output_async(client, region_id, response.body.invoke_id)
@@ -133,33 +140,52 @@ async def execute_xui_hybrid(instance_id: str, user_id: int, shell_script: str) 
     if not ip: 
         raise Exception("智能路由失败：SDK 未找到实例，且本地数据库未匹配公网 IP。")
         
-    # 将完整的 SSH 生命周期封装为一个同步任务，保证绝对的资源释放
     def _sync_ssh_task():
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
-        
+        client = None
         try:
-            # 严格限制连接超时
-            client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=6.0)
-            stdin, stdout, stderr = client.exec_command(shell_script, timeout=15.0)
+            import paramiko
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             
-            # 强制阻断长期无响应的通道
-            stdout.channel.settimeout(15.0)
-            stderr.channel.settimeout(15.0)
+            # ⭐ 动态密码：识别自定义机器
+            pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
+            if instance_id.startswith("ssh_"):
+                try:
+                    import db
+                    custom_pwd = db.get_custom_server_password(instance_id)
+                    if custom_pwd: pwd = custom_pwd
+                except Exception: pass
+            
+            # 建立连接允许 10 秒
+            client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=10.0)
+            
+            # ⭐ 核心修复：执行超时从 15 秒放宽到 120 秒！（安装面板需要时间）
+            stdin, stdout, stderr = client.exec_command(shell_script, timeout=120.0)
+            
+            # 强制阻断长期无响应的通道也放宽到 120 秒
+            stdout.channel.settimeout(120.0)
+            stderr.channel.settimeout(120.0)
             
             out_str = stdout.read().decode('utf-8', errors='ignore').strip()
             err_str = stderr.read().decode('utf-8', errors='ignore').strip()
             return (out_str + "\n" + err_str).strip() or "SUCCESS"
+            
+        except Exception as exec_e:
+            # ⭐ 修复报错为空的 BUG：如果 str(e) 为空，用 repr 强制显示类型
+            err_msg = str(exec_e) or repr(exec_e)
+            if "timeout" in err_msg.lower():
+                raise Exception("指令执行超时 (耗时任务可能仍在服务器后台运行，请等待1分钟后重试)")
+            raise Exception(f"SSH底层报错: {err_msg}")
         finally:
             # 无论成功还是报错，必定执行 close 清理内存与线程！
-            client.close()
+            if client:
+                client.close()
 
     try:
-        # 将安全封装的任务一次性丢给线程池，杜绝异步切换断层
         return await asyncio.to_thread(_sync_ssh_task)
     except Exception as e:
-        raise Exception(f"SSH 执行失败: {str(e)}")
+        # 直接抛出上面整理好的友好错误信息
+        raise Exception(str(e))
 
 # ================= 🎨 动态 UI 键盘渲染 =================
 def build_mg_keyboard(instance_id: str, is_installed: bool = True) -> InlineKeyboardMarkup:
@@ -178,6 +204,7 @@ def build_mg_keyboard(instance_id: str, is_installed: bool = True) -> InlineKeyb
 
     builder = [
         [InlineKeyboardButton(text="⚡ 一键生成 MG 专属节点 (直连 / 500G)", callback_data=f"mg_cmd:add_mtp_quick:{instance_id}")],
+        [InlineKeyboardButton(text="🛠️ 生成自定义节点 (自定义端口/密码/流量)", callback_data=f"mg_cmd:add_mtp_custom:{instance_id}")],
         [InlineKeyboardButton(text="📋 节点列表与端口管理 (改配置/重置流量)", callback_data=f"mg_cmd:port_list:{instance_id}")],
         [toggle_btn, InlineKeyboardButton(text="🔑 恢复默认账密", callback_data=f"mg_cmd:reset_pass:{instance_id}")],
         [InlineKeyboardButton(text="🤖 设置全局预警 Bot", callback_data=f"mg_cmd:set_bot:{instance_id}"), InlineKeyboardButton(text="🤖 一键下发绑定", callback_data=f"mg_cmd:bind_bot:{instance_id}")],
@@ -382,6 +409,18 @@ except:
                 await msg.edit_text("📋 <b>MG-UI 节点流量大盘</b>\n\n👇 点击下方任意端口，展开管控抽屉：", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         except Exception as e:
             await msg.edit_text(f"❌ 数据拉取失败：\n{str(e)}", parse_mode=None)
+
+    # ================= 🛠️ 自定义生成 MTP 节点 (触发 FSM) =================
+    if action == "add_mtp_custom":
+        await state.update_data(instance_id=instance_id)
+        await state.set_state(MguiCustomNodeFSM.wait_for_port)
+        await call.message.answer(
+            "🛠️ **生成自定义节点 (1/3)**\n\n"
+            "🌐 请输入您想要设置的**端口号** (范围 1-65535)：\n"
+            "*(回复 0 取消操作)*", 
+            parse_mode="Markdown"
+        )
+        return await call.answer()
 
     if action == "port_list":
         await render_mg_port_list(call.message, instance_id, call.from_user.id)
@@ -652,6 +691,152 @@ echo 'RESET_SUCCESS'
             return await show_mg_panel(call)
     except Exception as e:
         await msg_tip.edit_text(f"❌ 执行失败：\n{str(e)}", parse_mode=None)
+
+# ==========================================================
+# ============ 🛠️ 自定义节点生成逻辑 (FSM分步) ============
+# ==========================================================
+
+# # 1. 拦截【生成自定义节点】按钮点击
+# @router.callback_query(F.data.startswith("mg_cmd:add_mtp_custom:"))
+# async def start_custom_node(call: CallbackQuery, state: FSMContext):
+#     instance_id = call.data.split(":")[-1]
+    
+#     await state.update_data(instance_id=instance_id)
+#     await state.set_state(MguiCustomNodeFSM.wait_for_port)
+    
+#     await call.message.answer(
+#         "🛠️ **生成自定义节点 (1/3)**\n\n"
+#         "🌐 请输入您想要设置的**端口号** (范围 1-65535)：\n"
+#         "*(回复 0 取消操作)*", 
+#         parse_mode="Markdown"
+#     )
+#     await call.answer()
+
+# 2. 接收端口号 -> 询问密码
+@router.message(MguiCustomNodeFSM.wait_for_port)
+async def custom_node_port(message: Message, state: FSMContext):
+    port_text = message.text.strip()
+    if port_text == '0':
+        await state.clear()
+        return await message.answer("已取消自定义节点生成。")
+        
+    if not port_text.isdigit() or not (1 <= int(port_text) <= 65535):
+        return await message.answer("❌ 端口格式错误，请输入 1 到 65535 之间的纯数字：")
+
+    await state.update_data(port=port_text)
+    await state.set_state(MguiCustomNodeFSM.wait_for_pwd)
+    
+    await message.answer(
+        f"✅ 端口 `{port_text}` 已记录。\n\n"
+        "🔑 **(2/3)** 请输入该节点的**专属密码 (UUID / 密钥)**：\n"
+        "*(回复 0 取消)*", 
+        parse_mode="Markdown"
+    )
+
+# 3. 接收密码 -> 询问流量限制
+@router.message(MguiCustomNodeFSM.wait_for_pwd)
+async def custom_node_pwd(message: Message, state: FSMContext):
+    pwd_text = message.text.strip()
+    if pwd_text == '0':
+        await state.clear()
+        return await message.answer("已取消操作。")
+
+    await state.update_data(pwd=pwd_text)
+    await state.set_state(MguiCustomNodeFSM.wait_for_traffic)
+    
+    await message.answer(
+        f"✅ 密码已记录。\n\n"
+        "📶 **(3/3)** 请输入该节点的**流量限制 (GB)**：\n"
+        "*(例如输入 500 代表 500G，输入 0 代表不限流；回复 00 取消操作)*", 
+        parse_mode="Markdown"
+    )
+
+# 4. 接收流量限制 -> 执行下发 (终极完全版)
+@router.message(MguiCustomNodeFSM.wait_for_traffic)
+async def custom_node_traffic(message: Message, state: FSMContext):
+    traffic_text = message.text.strip()
+    if traffic_text == '00':
+        await state.clear()
+        return await message.answer("已取消操作。")
+        
+    if not traffic_text.isdigit():
+        return await message.answer("❌ 流量格式错误，请输入纯数字 (GB)：")
+
+    # 提取所有的自定义参数
+    data = await state.get_data()
+    instance_id = data['instance_id']
+    port = data['port']
+    pwd = data['pwd']
+    traffic_gb = float(traffic_text)
+    
+    await state.clear()
+    wait_msg = await message.answer(f"🔄 **正在向实例下发自定义节点...**\n⏳ 端口: `{port}` | 流量: `{traffic_gb} GB`", parse_mode="Markdown")
+
+    # ==========================================
+    # 核心执行区域：套用原生的 mg_core.db 逻辑
+    # ==========================================
+    ip = get_server_ip(instance_id)
+    today_day = datetime.datetime.now().day 
+    
+    # 组装 Shell 脚本 (替换为自定义参数，强制删除可能冲突的旧端口)
+    shell_script = f"""
+python3 -c "
+import sqlite3, datetime
+port = {port}; limit_gb = {traffic_gb}; secret = '{pwd}'
+
+conn = sqlite3.connect('/root/mg_core.db')
+c = conn.cursor()
+exp_date = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+
+# 如果该端口之前有旧数据，先强制清理，防止主键冲突
+c.execute('DELETE FROM mg_nodes WHERE port=?', (port,))
+c.execute('INSERT INTO mg_nodes (port, secret, limit_gb, used_bytes, status, reset_cycle, expiry_date) VALUES (?, ?, ?, 0, ?, ?, ?)', (port, secret, limit_gb, 'running', 'monthly', exp_date))
+conn.commit(); conn.close()
+print(f'MTP_RES:{{port}}|{{secret}}|{{exp_date}}')
+"
+iptables -C OUTPUT -p tcp --sport {port} 2>/dev/null || iptables -I OUTPUT -p tcp --sport {port}
+bash /root/mg_executor.sh start {port} "{pwd}"
+"""
+
+    try:
+        # 下发指令给服务器
+        out = await asyncio.wait_for(execute_xui_hybrid(instance_id, message.from_user.id, shell_script), timeout=45.0)
+        
+        if "MTP_RES:" not in out: 
+            raise Exception(f"底层调度异常: {out[:80]}")
+            
+        port_res, secret, exp_date_str = "", "", ""
+        for line in out.split("\n"):
+            if line.startswith("MTP_RES:"):
+                port_res, secret, exp_date_str = line.split(":", 1)[1].split("|")
+        
+        # 拼接 TG 的一键唤醒链接
+        mtp_link = f"tg://proxy?server={ip}&port={port_res}&secret={secret}"
+        traffic_display = "不限流量" if traffic_gb == 0 else f"{traffic_gb} GB"
+        
+        # 成功提示并附带返回面板的键盘
+        await wait_msg.edit_text(
+            f"🎉 <b>自定义节点生成成功！</b>\n\n"
+            f"🖥 <b>实例</b>：<code>{instance_id}</code>\n"
+            f"🔌 <b>分配端口</b>：<code>{port_res}</code>\n"
+            f"🔑 <b>节点密钥</b>：<code>{secret}</code>\n"
+            f"📊 <b>流量配额</b>：<b>{traffic_display}</b> (每月 {today_day} 号重置)\n"
+            f"📅 <b>到期时间</b>：<b>{exp_date_str}</b>\n\n"
+            f"🚀 <b>专属订阅链接 (点击自动唤起 TG 连接)：</b>\n<code>{mtp_link}</code>",
+            reply_markup=build_mg_keyboard(instance_id), 
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await wait_msg.edit_text(
+            f"❌ <b>节点创建失败：</b>\n<code>{str(e)}</code>", 
+            reply_markup=build_mg_keyboard(instance_id), 
+            parse_mode="HTML"
+        )
+
+    # ==========================================
+    # ⚠️ TODO: 核心执行区域等待你的代码！
+    # ==========================================
 
 # ================= 🚀 3. FSM：接收全局预警 Bot 绑定 =================
 @router.message(MguiBindBotFSM.wait_for_custom_token)

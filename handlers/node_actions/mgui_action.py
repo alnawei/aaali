@@ -88,40 +88,78 @@ async def fetch_command_output_async(client: EcsClient, region_id: str, invoke_i
             continue
     return "⏳底层执行超时_TIMEOUT"
 
-async def execute_xui_hybrid(instance_id: str, user_id: int, shell_script: str) -> str:
-    """双引擎智能路由执行器"""
-    region_id = get_region_by_instance(user_id, instance_id)
-    try:
-        client = get_ecs_client(region_id)
-        request = ecs_models.RunCommandRequest(
-            region_id=region_id, type='RunShellScript', command_content=encode_command(shell_script),
-            instance_id=[instance_id], name=f"MG_XUI_HYBRID", timeout=180
-        )
-        response = await asyncio.to_thread(client.run_command, request)
-        return await fetch_command_output_async(client, region_id, response.body.invoke_id)
-    except Exception as e:
-        if "InvalidInstance.NotFound" not in str(e) and "InstanceNotExists" not in str(e):
-            raise Exception(f"SDK 调用异常: {str(e)}")
+async def fetch_command_output_async(client: EcsClient, region_id: str, invoke_id: str) -> str:
+    req = ecs_models.DescribeInvocationResultsRequest(region_id=region_id, invoke_id=invoke_id)
+    # 不要一开始就睡死，先等极短的时间给底层分配任务
+    await asyncio.sleep(0.3)
+    
+    for i in range(12): # 控制最大重试次数，绝不无限循环
+        try:
+            resp = await asyncio.to_thread(client.describe_invocation_results, req)
+            if resp.body.invocation and resp.body.invocation.invocation_results.invocation_result:
+                res = resp.body.invocation.invocation_results.invocation_result[0]
+                if res.invocation_state in ["Success", "Failed", "Finished"]:
+                    out = res.output or ""
+                    return base64.b64decode(out).decode('utf-8', errors='ignore').strip() if out else "SUCCESS"
+        except Exception: 
+            pass # 忽略瞬间的网络波动
             
-    ip = get_server_ip(instance_id)
-    if not ip: raise Exception("智能路由失败：SDK 未找到实例，且本地数据库未匹配公网 IP。")
+        # 动态休眠：前几次极速探测，后面放缓防限流
+        await asyncio.sleep(0.5 if i < 3 else 1.0)
         
-    try:
+    return "⏳底层执行超时_TIMEOUT"
+
+
+async def execute_xui_hybrid(instance_id: str, user_id: int, shell_script: str) -> str:
+    """双引擎智能路由执行器 (带极速旁路与防死锁保护)"""
+    is_aliyun_instance = instance_id.startswith("i-")
+    
+    if is_aliyun_instance:
+        region_id = get_region_by_instance(user_id, instance_id)
+        try:
+            client = get_ecs_client(region_id)
+            request = ecs_models.RunCommandRequest(
+                region_id=region_id, type='RunShellScript', command_content=encode_command(shell_script),
+                instance_id=[instance_id], name=f"MG_XUI_HYBRID", timeout=60
+            )
+            response = await asyncio.to_thread(client.run_command, request)
+            return await fetch_command_output_async(client, region_id, response.body.invoke_id)
+        except Exception as e:
+            if "InvalidInstance.NotFound" not in str(e) and "InstanceNotExists" not in str(e):
+                raise Exception(f"SDK 调用异常: {str(e)}")
+                
+    # 走 SSH 降级或自定义服务器直连
+    ip = get_server_ip(instance_id)
+    if not ip: 
+        raise Exception("智能路由失败：SDK 未找到实例，且本地数据库未匹配公网 IP。")
+        
+    # 将完整的 SSH 生命周期封装为一个同步任务，保证绝对的资源释放
+    def _sync_ssh_task():
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
-        await asyncio.to_thread(client.connect, hostname=ip, port=22, username="root", password=pwd, timeout=8.0)
-        stdin, stdout, stderr = await asyncio.to_thread(client.exec_command, shell_script, timeout=60.0)
         
-        stdout.channel.settimeout(60.0)
-        stderr.channel.settimeout(60.0)
-        
-        out_str = (await asyncio.to_thread(stdout.read)).decode('utf-8').strip()
-        err_str = (await asyncio.to_thread(stderr.read)).decode('utf-8').strip()
-        client.close()
-        return (out_str + "\n" + err_str).strip() or "SUCCESS"
+        try:
+            # 严格限制连接超时
+            client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=6.0)
+            stdin, stdout, stderr = client.exec_command(shell_script, timeout=15.0)
+            
+            # 强制阻断长期无响应的通道
+            stdout.channel.settimeout(15.0)
+            stderr.channel.settimeout(15.0)
+            
+            out_str = stdout.read().decode('utf-8', errors='ignore').strip()
+            err_str = stderr.read().decode('utf-8', errors='ignore').strip()
+            return (out_str + "\n" + err_str).strip() or "SUCCESS"
+        finally:
+            # 无论成功还是报错，必定执行 close 清理内存与线程！
+            client.close()
+
+    try:
+        # 将安全封装的任务一次性丢给线程池，杜绝异步切换断层
+        return await asyncio.to_thread(_sync_ssh_task)
     except Exception as e:
-        raise Exception(f"SSH 降级执行失败: {str(e)}")
+        raise Exception(f"SSH 执行失败: {str(e)}")
 
 # ================= 🎨 动态 UI 键盘渲染 =================
 def build_mg_keyboard(instance_id: str, is_installed: bool = True) -> InlineKeyboardMarkup:
@@ -472,12 +510,24 @@ echo 'RAND_SEC_OK'
     # --- 新增：绑定置顶广告 ---
     if action.startswith("port_ad_tag-"):
         port = action.split("-")[1]
+        
+        # 修复：动态抓取当前端口的密钥
+        script = f"sqlite3 /root/mg_core.db 'SELECT secret FROM mg_nodes WHERE port={port}'"
+        out = await execute_xui_hybrid(instance_id, call.from_user.id, script)
+        secret = out.strip()
+        
+        # 提取 32 位纯 16 进制核心密钥 (如果使用的是 ee 开头的 Fake-TLS 密钥)
+        core_hex = secret[2:34] if secret.startswith("ee") and len(secret) > 34 else secret
+        
         await state.update_data(bind_instance_id=instance_id, bind_port=port)
         await state.set_state(MguiPortFSM.wait_for_ad_tag)
         await call.message.answer(
             f"📢 <b>绑定端口 <code>{port}</code> 的置顶广告频道</b>\n\n"
-            f"1️⃣ 请先前往 Telegram 官方 @MTProxybot 注册此服务器，并获取 <b>Ad Tag</b> (通常为 32 位随机字符)。\n"
-            f"2️⃣ 将获取到的 Ad Tag 发送给我：\n\n"
+            f"🤖 @MTProxybot 注册需要用到当前端口的密钥 (Secret)。\n"
+            f"🔑 <b>完整密钥 (点击复制)：</b>\n<code>{secret}</code>\n"
+            f"📌 <b>纯 16 进制密钥</b> <i>(若官方 Bot 提示格式不对，请复制这串)</i>：\n<code>{core_hex}</code>\n\n"
+            f"1️⃣ 请前往 Telegram 官方 @MTProxybot，发送服务器 IP、端口 <code>{port}</code> 和上方密钥进行注册，获取 <b>Ad Tag</b>。\n"
+            f"2️⃣ 将获取到的 Ad Tag (通常为 32 位字符) 发送给我：\n\n"
             f"(回复 0 取消操作)",
             parse_mode="HTML"
         )

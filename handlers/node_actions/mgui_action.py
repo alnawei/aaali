@@ -1,4 +1,3 @@
-import base64
 import asyncio
 import time
 import datetime
@@ -10,10 +9,6 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from alibabacloud_ecs20140526.client import Client as EcsClient
-from alibabacloud_ecs20140526 import models as ecs_models
-from alibabacloud_tea_openapi import models as open_api_models
-
 
 import config
 from db import get_active_servers
@@ -39,27 +34,6 @@ class MguiCustomNodeFSM(StatesGroup):
     wait_for_traffic = State()
 
 # ================= 🛠️ 底层客户端与双引擎工具 =================
-def get_ecs_client(region_id: str) -> EcsClient:
-    config_model = open_api_models.Config(
-        access_key_id=config.ALIYUN_ACCESS_KEY_ID,      
-        access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET 
-    )
-    config_model.endpoint = f'ecs.{region_id}.aliyuncs.com'
-    return EcsClient(config_model)
-
-def encode_command(command: str) -> str:
-    return base64.b64encode(command.encode('utf-8')).decode('utf-8')
-
-def get_region_by_instance(user_id: int, instance_id: str) -> str:
-    try:
-        servers = get_active_servers(user_id)
-        for srv in servers:
-            if srv["instance_id"] == instance_id:
-                return srv["region"]
-    except Exception:
-        pass
-    return "cn-hongkong"
-
 def get_server_ip(instance_id: str) -> str:
     try:
         db_path = getattr(config, 'DB_PATH', '/srv/aali/bot_data.db')
@@ -79,112 +53,71 @@ def get_server_ip(instance_id: str) -> str:
         pass
     return ""
 
-async def fetch_command_output_async(client: EcsClient, region_id: str, invoke_id: str) -> str:
-    req = ecs_models.DescribeInvocationResultsRequest(region_id=region_id, invoke_id=invoke_id)
-    for _ in range(20):
-        await asyncio.sleep(2.0)
-        try:
-            resp = await asyncio.to_thread(client.describe_invocation_results, req)
-            if resp.body.invocation and resp.body.invocation.invocation_results.invocation_result:
-                res = resp.body.invocation.invocation_results.invocation_result[0]
-                if res.invocation_state in ["Success", "Failed", "Finished"]:
-                    output_b64 = res.output or ""
-                    return base64.b64decode(output_b64).decode('utf-8', errors='ignore').strip() if output_b64 else "SUCCESS"
-        except Exception:
-            continue
-    return "⏳底层执行超时_TIMEOUT"
+def get_server_password(instance_id: str) -> str:
+    """从本地数据库获取手动添加的服务器密码"""
+    try:
+        db_path = getattr(config, 'DB_PATH', '/srv/aali/bot_data.db')
+        conn = sqlite3.connect(db_path, timeout=4.0)
+        cursor = conn.cursor()
+        for table in ["ecs_business", "servers", "ecs_instances", "instances"]:
+            try:
+                cursor.execute(f"SELECT password FROM {table} WHERE instance_id = ? LIMIT 1", (instance_id,))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    conn.close()
+                    return row[0].strip()
+            except Exception:
+                continue
+        conn.close()
+    except Exception:
+        pass
+    return ""
 
-async def fetch_command_output_async(client: EcsClient, region_id: str, invoke_id: str) -> str:
-    req = ecs_models.DescribeInvocationResultsRequest(region_id=region_id, invoke_id=invoke_id)
-    # 不要一开始就睡死，先等极短的时间给底层分配任务
-    await asyncio.sleep(0.3)
-    
-    for i in range(12): # 控制最大重试次数，绝不无限循环
-        try:
-            resp = await asyncio.to_thread(client.describe_invocation_results, req)
-            if resp.body.invocation and resp.body.invocation.invocation_results.invocation_result:
-                res = resp.body.invocation.invocation_results.invocation_result[0]
-                if res.invocation_state in ["Success", "Failed", "Finished"]:
-                    out = res.output or ""
-                    return base64.b64decode(out).decode('utf-8', errors='ignore').strip() if out else "SUCCESS"
-        except Exception: 
-            pass # 忽略瞬间的网络波动
-            
-        # 动态休眠：前几次极速探测，后面放缓防限流
-        await asyncio.sleep(0.5 if i < 3 else 1.0)
-        
-    return "⏳底层执行超时_TIMEOUT"
-
-
-async def execute_xui_hybrid(instance_id: str, user_id: int, shell_script: str) -> str:
-    """双引擎智能路由执行器 (带极速旁路与防死锁保护)"""
-    is_aliyun_instance = instance_id.startswith("i-")
-    
-    if is_aliyun_instance:
-        region_id = get_region_by_instance(user_id, instance_id)
-        try:
-            client = get_ecs_client(region_id)
-            request = ecs_models.RunCommandRequest(
-                region_id=region_id, type='RunShellScript', command_content=encode_command(shell_script),
-                instance_id=[instance_id], name=f"MG_XUI_HYBRID", 
-                timeout=120  # 阿里云 SDK 端也放宽到 120 秒
-            )
-            response = await asyncio.to_thread(client.run_command, request)
-            return await fetch_command_output_async(client, region_id, response.body.invoke_id)
-        except Exception as e:
-            if "InvalidInstance.NotFound" not in str(e) and "InstanceNotExists" not in str(e):
-                raise Exception(f"SDK 调用异常: {str(e)}")
-                
-    # 走 SSH 降级或自定义服务器直连
+async def execute_mg_hybrid(instance_id: str, user_id: int, shell_script: str) -> str:
+    """极速单轨 SSH 执行器 (彻底接管 MG 面板的所有服务器)"""
     ip = get_server_ip(instance_id)
     if not ip: 
-        raise Exception("智能路由失败：SDK 未找到实例，且本地数据库未匹配公网 IP。")
+        raise Exception("智能路由失败：无法在本地数据库中找到该实例的公网 IP。")
         
     def _sync_ssh_task():
         client = None
         try:
-            import paramiko
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             
-            # ⭐ 动态密码：识别自定义机器
-            pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
-            if instance_id.startswith("ssh_"):
-                try:
-                    import db
-                    custom_pwd = db.get_custom_server_password(instance_id)
-                    if custom_pwd: pwd = custom_pwd
-                except Exception: pass
+            # ⭐ 智能判断密码来源
+            if instance_id.startswith("i-"):
+                pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
+            else:
+                pwd = get_server_password(instance_id)
+                if not pwd:
+                    raise Exception("无法在数据库中读取到该手动实例的 SSH 密码。")
             
-            # 建立连接允许 10 秒
-            client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=10.0)
+            # 建立连接允许 8 秒
+            client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=8.0)
             
-            # ⭐ 核心修复：执行超时从 15 秒放宽到 120 秒！（安装面板需要时间）
-            stdin, stdout, stderr = client.exec_command(shell_script, timeout=120.0)
+            # ⭐ 执行超时统一放宽到 180 秒（保护安装和探测）
+            stdin, stdout, stderr = client.exec_command(shell_script, timeout=180.0)
             
-            # 强制阻断长期无响应的通道也放宽到 120 秒
-            stdout.channel.settimeout(120.0)
-            stderr.channel.settimeout(120.0)
+            stdout.channel.settimeout(180.0)
+            stderr.channel.settimeout(180.0)
             
             out_str = stdout.read().decode('utf-8', errors='ignore').strip()
             err_str = stderr.read().decode('utf-8', errors='ignore').strip()
             return (out_str + "\n" + err_str).strip() or "SUCCESS"
             
         except Exception as exec_e:
-            # ⭐ 修复报错为空的 BUG：如果 str(e) 为空，用 repr 强制显示类型
             err_msg = str(exec_e) or repr(exec_e)
             if "timeout" in err_msg.lower():
-                raise Exception("指令执行超时 (耗时任务可能仍在服务器后台运行，请等待1分钟后重试)")
+                raise Exception("指令执行超时 (耗时任务可能仍在后台运行，请等待片刻后重试)")
             raise Exception(f"SSH底层报错: {err_msg}")
         finally:
-            # 无论成功还是报错，必定执行 close 清理内存与线程！
             if client:
                 client.close()
 
     try:
         return await asyncio.to_thread(_sync_ssh_task)
     except Exception as e:
-        # 直接抛出上面整理好的友好错误信息
         raise Exception(str(e))
 
 # ================= 🎨 动态 UI 键盘渲染 =================
@@ -228,7 +161,7 @@ async def show_mg_panel(call: CallbackQuery):
     
     probe_script = "if [ -f /root/mg_panel.py ]; then echo 'INSTALLED'; else echo 'MISSING'; fi"
     try:
-        probe_res = await execute_xui_hybrid(instance_id, call.from_user.id, probe_script)
+        probe_res = await execute_mg_hybrid(instance_id, call.from_user.id, probe_script)
         if "INSTALLED" in probe_res:
             is_installed = True
         elif "MISSING" in probe_res:
@@ -287,7 +220,7 @@ except: pass
 print(f'PORT={port}\\nUSER={user}\\nPASS={pwd}')
 "
 """
-        info_res = await execute_xui_hybrid(instance_id, call.from_user.id, shell_script)
+        info_res = await execute_mg_hybrid(instance_id, call.from_user.id, shell_script)
         data_map = {k.strip(): v.strip() for k, v in [line.split("=", 1) for line in info_res.split("\n") if "=" in line]}
         
         is_running = (data_map.get("PANEL_STATUS") == "running")
@@ -347,7 +280,7 @@ iptables -C OUTPUT -p tcp --sport {port} 2>/dev/null || iptables -I OUTPUT -p tc
 bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}")
 """
         try:
-            out = await asyncio.wait_for(execute_xui_hybrid(instance_id, call.from_user.id, shell_script), timeout=45.0)
+            out = await asyncio.wait_for(execute_mg_hybrid(instance_id, call.from_user.id, shell_script), timeout=180.0)
             if "MTP_RES:" not in out: raise Exception(f"底层调度异常: {out[:80]}")
             
             port_res, secret, exp_date_str = "", "", ""
@@ -388,7 +321,7 @@ except:
 "
 """
         try:
-            out = await execute_xui_hybrid(inst_id, u_id, shell_script)
+            out = await execute_mg_hybrid(inst_id, u_id, shell_script)
             buttons = []
             for line in out.split("\n"):
                 if line.startswith("NODE:"):
@@ -452,7 +385,7 @@ except: pass
 "
 """
         try:
-            out = await execute_xui_hybrid(instance_id, call.from_user.id, script)
+            out = await execute_mg_hybrid(instance_id, call.from_user.id, script)
             info_str = ""
             for line in out.split("\n"):
                 if line.startswith("INFO:"):
@@ -495,7 +428,7 @@ except: pass
     if action.startswith("port_link-"):
         port = action.split("-")[1]
         script = f"sqlite3 /root/mg_core.db 'SELECT secret FROM mg_nodes WHERE port={port}'"
-        out = await execute_xui_hybrid(instance_id, call.from_user.id, script)
+        out = await execute_mg_hybrid(instance_id, call.from_user.id, script)
         secret = out.strip()
         
         if secret and "ERR" not in secret and "no such table" not in secret:
@@ -546,7 +479,7 @@ conn.close()
 "
 bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}")
 """
-        await execute_xui_hybrid(instance_id, call.from_user.id, script)
+        await execute_mg_hybrid(instance_id, call.from_user.id, script)
         await call.answer(f"✅ 端口 {port} 已成功续费 1 个自然月！", show_alert=True)
         return await render_mg_port_list(call.message, instance_id, call.from_user.id)
 
@@ -569,7 +502,7 @@ bash /root/mg_executor.sh delete {port}
 bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret FROM mg_nodes WHERE port={port}")
 echo 'RAND_SEC_OK'
 """
-        await execute_xui_hybrid(instance_id, call.from_user.id, script)
+        await execute_mg_hybrid(instance_id, call.from_user.id, script)
         await call.answer(f"✅ 端口 {port} 的密钥已随机更换并重启！", show_alert=True)
         
         # 修复：取消死循环，改为显示成功提示并提供返回按钮
@@ -601,7 +534,7 @@ echo 'RAND_SEC_OK'
         
         # 修复：动态抓取当前端口的密钥
         script = f"sqlite3 /root/mg_core.db 'SELECT secret FROM mg_nodes WHERE port={port}'"
-        out = await execute_xui_hybrid(instance_id, call.from_user.id, script)
+        out = await execute_mg_hybrid(instance_id, call.from_user.id, script)
         secret = out.strip()
         
         # 提取 32 位纯 16 进制核心密钥 (如果使用的是 ee 开头的 Fake-TLS 密钥)
@@ -629,7 +562,7 @@ iptables -D OUTPUT -p tcp --sport {port} 2>/dev/null || true
 iptables -I OUTPUT -p tcp --sport {port}
 echo 'RST_OK'
 """
-        await execute_xui_hybrid(instance_id, call.from_user.id, script)
+        await execute_mg_hybrid(instance_id, call.from_user.id, script)
         await call.answer(f"✅ 端口 {port} 的已用流量已强行清零！", show_alert=True)
         return await render_mg_port_list(call.message, instance_id, call.from_user.id)
 
@@ -641,7 +574,7 @@ iptables -D OUTPUT -p tcp --sport {port} 2>/dev/null || true
 sqlite3 /root/mg_core.db "DELETE FROM mg_nodes WHERE port={port}"
 echo 'DEL_OK'
 """
-        await execute_xui_hybrid(instance_id, call.from_user.id, script)
+        await execute_mg_hybrid(instance_id, call.from_user.id, script)
         await call.answer(f"🗑️ 端口 {port} 节点已彻底销毁！", show_alert=True)
         return await render_mg_port_list(call.message, instance_id, call.from_user.id)
 
@@ -690,7 +623,7 @@ systemctl enable mg-bot
 systemctl restart mg-bot
 echo 'SUCCESS'
 """
-        await execute_xui_hybrid(instance_id, call.from_user.id, script)
+        await execute_mg_hybrid(instance_id, call.from_user.id, script)
         await call.answer("✅ 一键下发成功！预警管家已上线。", show_alert=True)
         return await show_mg_panel(call)
 
@@ -728,7 +661,7 @@ echo 'RESET_SUCCESS'
         shell_script = "echo 'Unknown command'"
 
     try:
-        await execute_xui_hybrid(instance_id, call.from_user.id, shell_script)
+        await execute_mg_hybrid(instance_id, call.from_user.id, shell_script)
         if action in ["start", "stop", "reset_pass", "install", "uninstall"]:
             if action in ["start", "install", "reset_pass"]:
                 MG_CACHE[instance_id] = {"panel_status": "running", "expire": time.time() + CACHE_TTL_SECONDS}
@@ -744,22 +677,6 @@ echo 'RESET_SUCCESS'
 # ==========================================================
 # ============ 🛠️ 自定义节点生成逻辑 (FSM分步) ============
 # ==========================================================
-
-# # 1. 拦截【生成自定义节点】按钮点击
-# @router.callback_query(F.data.startswith("mg_cmd:add_mtp_custom:"))
-# async def start_custom_node(call: CallbackQuery, state: FSMContext):
-#     instance_id = call.data.split(":")[-1]
-    
-#     await state.update_data(instance_id=instance_id)
-#     await state.set_state(MguiCustomNodeFSM.wait_for_port)
-    
-#     await call.message.answer(
-#         "🛠️ **生成自定义节点 (1/3)**\n\n"
-#         "🌐 请输入您想要设置的**端口号** (范围 1-65535)：\n"
-#         "*(回复 0 取消操作)*", 
-#         parse_mode="Markdown"
-#     )
-#     await call.answer()
 
 # 2. 接收端口号 -> 询问密码
 @router.message(MguiCustomNodeFSM.wait_for_port)
@@ -849,7 +766,7 @@ bash /root/mg_executor.sh start {port} "{pwd}"
 
     try:
         # 下发指令给服务器
-        out = await asyncio.wait_for(execute_xui_hybrid(instance_id, message.from_user.id, shell_script), timeout=45.0)
+        out = await asyncio.wait_for(execute_mg_hybrid(instance_id, call.from_user.id, shell_script), timeout=180.0)
         
         if "MTP_RES:" not in out: 
             raise Exception(f"底层调度异常: {out[:80]}")
@@ -882,10 +799,6 @@ bash /root/mg_executor.sh start {port} "{pwd}"
             reply_markup=build_mg_keyboard(instance_id), 
             parse_mode="HTML"
         )
-
-    # ==========================================
-    # ⚠️ TODO: 核心执行区域等待你的代码！
-    # ==========================================
 
 # ================= 🚀 3. FSM：接收全局预警 Bot 绑定 =================
 @router.message(MguiBindBotFSM.wait_for_custom_token)
@@ -953,7 +866,7 @@ bash /root/mg_executor.sh start {port} '{secret}'
 echo 'SET_SEC_OK'
 """
     try:
-        await execute_xui_hybrid(instance_id, message.from_user.id, script)
+        await execute_mg_hybrid(instance_id, message.from_user.id, script)
         await wait_msg.edit_text(f"✅ <b>密钥修改成功！</b>\n\n端口 <code>{port}</code> 已使用新密钥重启。\n请返回控制台重新获取直连链接。", parse_mode="HTML")
     except Exception as e:
         await wait_msg.edit_text(f"❌ 修改失败：\n{str(e)}")
@@ -989,7 +902,7 @@ bash /root/mg_executor.sh start {port} $(sqlite3 /root/mg_core.db "SELECT secret
 echo 'SET_AD_OK'
 """
     try:
-        await execute_xui_hybrid(instance_id, message.from_user.id, script)
+        await execute_mg_hybrid(instance_id, message.from_user.id, script)
         await wait_msg.edit_text(
             f"📢 <b>广告 Tag 绑定下发成功！</b>\n\n"
             f"已将凭证 <code>{ad_tag}</code> 挂载至端口 <code>{port}</code>。\n"

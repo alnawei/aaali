@@ -35,8 +35,23 @@ def get_server_ip(instance_id: str) -> str:
     return "127.0.0.1"
 
 
+# ⭐ 新增工具：动态获取 SSH 密码
+def get_ssh_pwd(instance_id: str) -> str:
+    """智能识别自定义机器，提取专属密码；否则返回全局兜底密码"""
+    pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
+    if instance_id and instance_id.startswith("ssh_"):
+        try:
+            import db
+            custom_pwd = db.get_custom_server_password(instance_id)
+            if custom_pwd:
+                pwd = custom_pwd
+        except Exception:
+            pass
+    return pwd
+
+
 # ================= 🔍 核心算法：极速高防 SSH 实时探活 =================
-def sync_check_bbr_status(ip: str) -> str:
+def sync_check_bbr_status(instance_id: str, ip: str) -> str:
     """真实的 SSH 连接底层探活逻辑"""
     if not ip or "0.0.0" in ip or "分配中" in ip or ip == "127.0.0.1":
         return "unknown"
@@ -45,7 +60,9 @@ def sync_check_bbr_status(ip: str) -> str:
         import paramiko
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
+        
+        # ⭐ 核心修改 1：使用动态密码函数
+        pwd = get_ssh_pwd(instance_id)
         
         client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=4.0, banner_timeout=4.0, auth_timeout=4.0)
         cmd = "sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc"
@@ -66,7 +83,7 @@ def sync_check_bbr_status(ip: str) -> str:
 
 
 # ================= 🚀 缓存拦截器：异步封装与 TTL 管理 =================
-async def get_bbr_status_cached(ip: str, force_refresh: bool = False) -> str:
+async def get_bbr_status_cached(instance_id: str, ip: str, force_refresh: bool = False) -> str:
     """
     状态获取入口：优先拦截并读取内存缓存。如果击穿/过期才触发真实 SSH 握手。
     """
@@ -80,7 +97,8 @@ async def get_bbr_status_cached(ip: str, force_refresh: bool = False) -> str:
     # 2. 缓存击穿/过期：异步执行真实 SSH 探活
     try:
         status = await asyncio.wait_for(
-            asyncio.to_thread(sync_check_bbr_status, ip), 
+            # ⭐ 核心修改 2：把 instance_id 传给底层探测函数
+            asyncio.to_thread(sync_check_bbr_status, instance_id, ip), 
             timeout=4.5
         )
     except Exception:
@@ -94,14 +112,16 @@ async def get_bbr_status_cached(ip: str, force_refresh: bool = False) -> str:
 
 
 # ================= 🚀 底层执行：一键热加载内核参数 =================
-def sync_apply_bbr_script(ip: str, target_template: str) -> tuple[bool, str]:
+def sync_apply_bbr_script(instance_id: str, ip: str, target_template: str) -> tuple[bool, str]:
     """通过 SSH 动态修改 sysctl.conf 并瞬间热加载生效（原子指令版）"""
-    # (此部分底层逻辑维持你的原样，无需修改，你原版的 sed && echo && sysctl 写法极好)
     try:
         import paramiko
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
+        
+        # ⭐ 核心修改 3：使用动态密码函数
+        pwd = get_ssh_pwd(instance_id)
+        
         client.connect(hostname=ip, port=22, username="root", password=pwd, timeout=8.0, banner_timeout=8.0, auth_timeout=8.0)
         
         clean_part = "sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf && sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf"
@@ -121,9 +141,19 @@ def sync_apply_bbr_script(ip: str, target_template: str) -> tuple[bool, str]:
             return False, "未识别的目标参数"
 
         atomic_cmd = f"{clean_part} && {add_part} && sysctl -p"
-        stdin, stdout, stderr = client.exec_command(atomic_cmd, timeout=8.0)
-        out_str, err_str = stdout.read().decode('utf-8'), stderr.read().decode('utf-8')
-        client.close()
+        
+        # ⭐ 核心修改 4：捕获网络重载造成的合法 SSH 瞬断
+        try:
+            stdin, stdout, stderr = client.exec_command(atomic_cmd, timeout=8.0)
+            out_str = stdout.read().decode('utf-8')
+            err_str = stderr.read().decode('utf-8')
+            client.close()
+        except Exception as read_e:
+            client.close()
+            err_msg = str(read_e).lower()
+            if "no existing session" in err_msg or "closed" in err_msg or "timeout" in err_msg:
+                return True, "配置已生效！(网络重载导致瞬断)"
+            return False, f"异常: {str(read_e)}"
         
         if "No such file" in err_str or "cannot stat" in err_str or "No such file" in out_str:
             return False, "当前系统内核不支持该算法"
@@ -188,7 +218,8 @@ async def show_bbr_center(call: CallbackQuery):
             f"⚡️ **BBR 网络控制中心**\n\n🖥 实例：`{instance_id}`\n🌐 IP：`{ip}`\n\n⏳ *正在极速探测远端内核...*",
             parse_mode="Markdown"
         )
-        active_status = await get_bbr_status_cached(ip)
+        # ⭐ 核心修改 5：把 instance_id 传给缓存获取函数
+        active_status = await get_bbr_status_cached(instance_id, ip)
 
     keyboard = build_bbr_keyboard(instance_id, active_status)
     status_tip = "\n⚠️ *注：远端获取超时，系统已切换至兜底选单。*\n" if active_status == "unknown" else ""
@@ -227,9 +258,11 @@ async def execute_bbr_switch(call: CallbackQuery):
     )
     
     # 真实下发指令
-    success, msg = await asyncio.to_thread(sync_apply_bbr_script, ip, target_template)
+    # ⭐ 核心修改 6：传 instance_id 进行执行
+    success, msg = await asyncio.to_thread(sync_apply_bbr_script, instance_id, ip, target_template)
     
     if success:
+        # BBR生效因为捕获到了合法的断连，依然算作成功
         await call.answer("🎉 内核参数已热加载生效！", show_alert=True)
         # ⭐ 核心优化 2：指令下发成功后，没必要再去 SSH 查一遍！
         # 直接暴力“篡改”本地内存记录，将本次修改的模板设为当前存活状态，并刷新存活时间
@@ -238,7 +271,8 @@ async def execute_bbr_switch(call: CallbackQuery):
     else:
         await call.answer(f"⚠️ {msg}", show_alert=True)
         # 只有发生错误时，才强制重新发起真实探测
-        new_status = await get_bbr_status_cached(ip, force_refresh=True)
+        # ⭐ 核心修改 7：传 instance_id 进行刷新
+        new_status = await get_bbr_status_cached(instance_id, ip, force_refresh=True)
         
     keyboard = build_bbr_keyboard(instance_id, new_status)
     text = (

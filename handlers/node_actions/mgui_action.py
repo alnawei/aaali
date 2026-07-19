@@ -430,6 +430,54 @@ except:
     # ================= 🎛 单个端口专属管控抽屉 =================
     if action.startswith("port_ctrl-"):
         port = action.split("-")[1]
+        
+        # 1. 发送加载提示，因为我们需要去远端数据库查询实时流量
+        await call.message.edit_text(f"⏳ 正在查询端口 <code>{port}</code> 的实时流量与详情...", parse_mode="HTML")
+        
+        # 2. 从远端数据库精准拉取该端口的详细信息
+        script = f"""
+python3 -c "
+import sqlite3
+try:
+    conn = sqlite3.connect('/root/mg_core.db')
+    c = conn.cursor()
+    c.execute('SELECT limit_gb, used_bytes, expiry_date, status FROM mg_nodes WHERE port={port}')
+    row = c.fetchone()
+    if row:
+        used_gb = (row[1] if row[1] else 0) / (1024**3)
+        limit_str = '不限' if row[0] == 0 else f'{{row[0]:.0f}} GB'
+        print(f'INFO:{{limit_str}}|{{used_gb:.2f}} GB|{{row[2]}}|{{row[3]}}')
+    conn.close()
+except: pass
+"
+"""
+        try:
+            out = await execute_xui_hybrid(instance_id, call.from_user.id, script)
+            info_str = ""
+            for line in out.split("\n"):
+                if line.startswith("INFO:"):
+                    info_str = line.replace("INFO:", "")
+            
+            # 3. 格式化排版详情面板
+            if info_str:
+                limit_gb, used_gb, exp_date, status = info_str.split("|")
+                status_cn = "🟢 正常运行" if status == "running" else f"🔴 {status}"
+                detail_text = (
+                    f"🎛 <b>专属端口管控台：<code>{port}</code></b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 <b>运行状态</b>：{status_cn}\n"
+                    f"📊 <b>流量配额</b>：已用 <b>{used_gb}</b> / 总额 {limit_gb}\n"
+                    f"📅 <b>到期时间</b>：<code>{exp_date}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"👇 请选择你要对该节点执行的操作："
+                )
+            else:
+                detail_text = f"🎛 <b>专属端口管控台：<code>{port}</code></b>\n\n⚠️ (未能获取到详细数据，节点可能已被删除)\n\n👇 请选择你要执行的操作："
+                
+        except Exception:
+            detail_text = f"🎛 <b>专属端口管控台：<code>{port}</code></b>\n\n⚠️ (查询详情超时，请稍后重试)\n\n👇 请选择你要执行的操作："
+
+        # 4. 渲染底部功能按钮
         buttons = [
             [InlineKeyboardButton(text="🔗 获取该节点专属分享链接", callback_data=f"mg_cmd:port_link-{port}:{instance_id}")],
             [InlineKeyboardButton(text="🔄 更换随机密钥", callback_data=f"mg_cmd:port_rand_sec-{port}:{instance_id}"),
@@ -440,7 +488,8 @@ except:
             [InlineKeyboardButton(text="🗑️ 彻底删除此节点 (不可逆)", callback_data=f"mg_cmd:port_del-{port}:{instance_id}")],
             [InlineKeyboardButton(text="🔙 返回节点列表", callback_data=f"mg_cmd:port_list:{instance_id}")]
         ]
-        await call.message.edit_text(f"🎛 <b>专属端口管控台：<code>{port}</code></b>\n\n请选择你要对该节点执行的操作：", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+        
+        await call.message.edit_text(detail_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         return await call.answer()
 
     if action.startswith("port_link-"):

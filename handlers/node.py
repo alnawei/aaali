@@ -4,7 +4,7 @@ from aiogram import Router, F, types
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from db import get_active_servers  
 import asyncio
-
+import paramiko
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -293,7 +293,20 @@ async def process_del_custom_server(call: types.CallbackQuery):
 # ================= ➕ 添加自定义服务器逻辑 (FSM) =====================
 # =====================================================================
 
-# 1. 拦截“添加”按钮点击
+# ================= 🛡️ 辅助探测函数 =================
+async def test_ssh_connection(ip: str, password: str, port: int = 22) -> bool:
+    """极速探测 SSH 是否可用 (超时 5 秒)"""
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # 只做连接测试，不执行命令
+        await asyncio.to_thread(client.connect, hostname=ip, port=port, username="root", password=password, timeout=5.0)
+        client.close()
+        return True
+    except Exception:
+        return False
+
+# ================= 1. 拦截“添加”按钮点击 =================
 @router.callback_query(F.data == "custom_srv:add")
 async def add_custom_server_start(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != config.ADMIN_ID:
@@ -303,7 +316,7 @@ async def add_custom_server_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.answer("➕ **添加自定义服务器 (SSH)**\n\n🌐 请输入服务器的公网 IP 地址：\n*(回复 0 取消操作)*", parse_mode="Markdown")
     await call.answer()
 
-# 2. 接收 IP
+# ================= 2. 接收 IP =================
 @router.message(MguiAddServerFSM.wait_for_ip)
 async def add_custom_server_ip(message: types.Message, state: FSMContext):
     ip = message.text.strip()
@@ -315,7 +328,7 @@ async def add_custom_server_ip(message: types.Message, state: FSMContext):
     await state.set_state(MguiAddServerFSM.wait_for_pwd)
     await message.answer(f"✅ IP `{ip}` 已记录。\n\n🔑 请输入该服务器的 Root 密码：\n*(回复 0 取消操作)*", parse_mode="Markdown")
 
-# 3. 接收密码并存库
+# ================= 3. 接收密码 (增加 SSH 探活拦截) =================
 @router.message(MguiAddServerFSM.wait_for_pwd)
 async def add_custom_server_pwd(message: types.Message, state: FSMContext):
     pwd = message.text.strip()
@@ -326,27 +339,70 @@ async def add_custom_server_pwd(message: types.Message, state: FSMContext):
     data = await state.get_data()
     ip = data['ip']
     
-    # ⭐ 核心：生成不以 i- 开头的虚拟 instance_id，以区分阿里云机器
-    instance_id = f"ssh_{ip.replace('.', '_')}" 
+    # 先发一条等待消息
+    wait_msg = await message.answer(f"⏳ 正在探测服务器 `{ip}` 的连通性，请稍候...", parse_mode="Markdown")
+    
+    # 发起真实 SSH 连接探测
+    is_connected = await test_ssh_connection(ip, pwd)
+    
+    if is_connected:
+        # ✅ 连接成功：执行存库
+        instance_id = f"ssh_{ip.replace('.', '_')}" 
 
-    try:
-        import db
-        db.add_custom_server(instance_id, ip, pwd)
-        await state.clear()
-        
-        # 给一个单独的返回按钮，指向 node.py 原本的返回第一步的回调 "back_to_srv_list"
+        try:
+            import db
+            db.add_custom_server(instance_id, ip, pwd)
+            await state.clear()
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 刷新节点配置列表", callback_data="back_to_srv_list")]
+            ])
+            
+            await wait_msg.edit_text(
+                f"🎉 **自定义服务器添加成功！**\n\n"
+                f"✅ **SSH 测试通过**，已确认服务器存活！\n"
+                f"🌐 IP: `{ip}`\n"
+                f"🆔 实例标识: `{instance_id}`\n\n"
+                f"已无缝接入节点配置中心，请点击下方按钮刷新面板。",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ 添加失败，可能是数据库写入异常: {e}")
+    else:
+        # 🔴 连接失败：拦截保存，弹出重试或删除面板
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 刷新节点配置列表", callback_data="back_to_srv_list")]
+            [InlineKeyboardButton(text="🔄 重新填写密码", callback_data="custom_srv:retry_pwd")],
+            [InlineKeyboardButton(text="🗑️ 取消添加 (放弃保存)", callback_data="custom_srv:cancel")]
         ])
         
-        await message.answer(
-            f"🎉 **自定义服务器添加成功！**\n\n"
-            f"🌐 IP: `{ip}`\n"
-            f"🆔 实例标识: `{instance_id}`\n\n"
-            f"已无缝接入节点配置中心，请点击下方按钮刷新面板。",
+        await wait_msg.edit_text(
+            f"🔴 **连接失败！**\n\n无法通过 SSH 连上 `{ip}`。\n可能是密码错误、22端口未开或禁止 Root 登录。\n\n请选择后续操作：",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
+
+# ================= 4. 处理重试与取消操作 =================
+@router.callback_query(F.data == "custom_srv:retry_pwd")
+async def retry_custom_server_pwd(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    ip = data.get('ip')
+    if not ip:
+        return await call.message.edit_text("❌ 会话已过期，请重新发起添加操作。")
         
-    except Exception as e:
-        await message.answer(f"❌ 添加失败，可能是数据库写入异常: {e}")
+    await state.set_state(MguiAddServerFSM.wait_for_pwd)
+    await call.message.edit_text(
+        f"👉 请重新输入服务器 `{ip}` 的 SSH 密码 (root):\n*(回复 0 取消操作)*", 
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+@router.callback_query(F.data == "custom_srv:cancel")
+async def cancel_custom_server_add(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 返回节点配置列表", callback_data="back_to_srv_list")]
+    ])
+    await call.message.edit_text("🗑️ 操作已取消，无效的服务器信息已被丢弃。", reply_markup=keyboard)
+    await call.answer()

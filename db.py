@@ -4,7 +4,6 @@ import logging
 from datetime import datetime
 import config  # 统一从 config 获取配置与路径
 import os
-
 DB_PATH = config.DB_PATH  # ⭐ 就是加在这里！导出给 tasks.py 等外部模块调用
 
 logger = logging.getLogger("MG_Bot.DB")
@@ -54,6 +53,15 @@ def init_db():
                 region_id TEXT PRIMARY KEY,
                 region_name TEXT,
                 template_id TEXT
+            )
+        """)
+
+        # 4. 自定义 SSH 服务器表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS custom_servers (
+                instance_id TEXT PRIMARY KEY,
+                ip TEXT,
+                root_password TEXT
             )
         """)
         
@@ -216,5 +224,56 @@ def delete_template(region_id: str):
     except Exception as e:
         logger.error(f"删除模板失败 region_id={region_id}: {e}")
         raise e
+    finally:
+        conn.close()
+
+
+def add_custom_server(instance_id: str, ip: str, password: str):
+    """添加自定义 SSH 服务器，并自动在账单表中初始化一条记录防止面板崩溃"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("REPLACE INTO custom_servers (instance_id, ip, root_password) VALUES (?, ?, ?)", 
+                       (instance_id, ip, password))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"添加自定义服务器失败: {e}")
+        raise e
+    finally:
+        conn.close()
+    
+    # 同步初始化业务数据表，保证全局联动不出错
+    get_business_data(instance_id)
+    update_business_data(instance_id, "ip", ip)
+
+def get_custom_server_password(instance_id: str) -> str:
+    """提取该自定义机器的独立密码"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT root_password FROM custom_servers WHERE instance_id = ?", (instance_id,))
+        row = cursor.fetchone()
+        return row[0] if row else ""
+    finally:
+        conn.close()
+
+def get_all_custom_servers() -> list:
+    """获取所有自定义机器，用于面板列表展示"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT instance_id, ip FROM custom_servers")
+        return [{"id": r[0], "ip": r[1], "status": "Running"} for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+def delete_custom_server(instance_id: str):
+    """删除自定义服务器及其关联业务数据"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM custom_servers WHERE instance_id = ?", (instance_id,))
+        cursor.execute("DELETE FROM ecs_business WHERE instance_id = ?", (instance_id,))
+        conn.commit()
     finally:
         conn.close()

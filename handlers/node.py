@@ -1,8 +1,17 @@
 import sqlite3
 import config
-from aiogram import Router, F
+from aiogram import Router, F, types
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from db import get_active_servers  # 导入你的真实查询函数
+from db import get_active_servers  
+import asyncio
+
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+# ================= 1. 定义添加服务器的 FSM 状态机 =================
+class MguiAddServerFSM(StatesGroup):
+    wait_for_ip = State()
+    wait_for_pwd = State()
 
 router = Router()
 
@@ -49,14 +58,14 @@ def get_servers_data(user_id: int):
             real_ip = None
             # 尝试调用你已经在服务器管理里好使的阿里云接口抓一把真 IP
             try:
-                from utils.aliyun import get_instance_ip # 或者是 get_instance_info
+                from utils.aliyun import get_instance_ip 
                 real_ip = get_instance_ip(inst_id)
             except Exception:
                 pass
                 
             if real_ip and "0.0.0" not in real_ip:
                 srv["ip"] = real_ip
-                # 顺手将你刚才回显出问题的 ecs_business 表里的脏数据永久抹除！
+                # 顺手将表里的脏数据永久抹除！
                 try:
                     conn = sqlite3.connect('/srv/aali/bot_data.db', timeout=3.0)
                     conn.execute("UPDATE ecs_business SET ip = ? WHERE instance_id = ?", (real_ip, inst_id))
@@ -75,14 +84,13 @@ def build_servers_keyboard(user_id: int):
     servers = get_servers_data(user_id)
     builder = []
     
+    # 1. 遍历并展示所有在管机器（阿里云机器 + 自定义机器）
     for srv in servers:
         inst_id = srv.get("instance_id", "")
         ip_display = srv.get("ip", "0.0.0.0")
         
-        # 1. 获取服务器状态，支持常见字段兼容 (status / state / run_status 等)
         status_raw = str(srv.get("status", srv.get("state", "Running"))).lower()
         
-        # 2. 动态匹配状态灯符号（完全对齐“服务器管理”的视觉标准）
         if "running" in status_raw or "运行" in status_raw or "正常" in status_raw or status_raw == "1":
             status_icon = "🟢"
         elif "stopped" in status_raw or "停" in status_raw or "关" in status_raw or status_raw == "0":
@@ -90,35 +98,108 @@ def build_servers_keyboard(user_id: int):
         else:
             status_icon = "🔵"
         
-        # 3. 如果刚开机一瞬间还写着 0.0.0.0，自动切成蓝色等待灯
         if ip_display == "0.0.0.0" or not ip_display:
             ip_display = "阿里云分配IP中..."
             status_icon = "🔵"
             
         cb_data = f"srv_sel:{inst_id}"
-        
-        # ⭐ 组合最终的 UI 显示：【 🟢 IP: 47.76.172.65 】
         button_text = f"{status_icon} IP: {ip_display}" if "分配中" not in ip_display else f"{status_icon} {ip_display}"
         builder.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
     
+    # 2. ⭐ 核心新增：在列表最底部永远挂载“添加自定义服务器”入口
+    builder.append([InlineKeyboardButton(text="➕ 添加自定义服务器 (SSH)", callback_data="custom_srv:add")])
+    
     return InlineKeyboardMarkup(inline_keyboard=builder)
-
-
 
 # ================= 🚀 第一步：接收主菜单点击 =================
 @router.message(F.text == "⚙️ 节点配置")
-async def show_node_list(message: Message):
+async def show_node_list(message: types.Message):
     keyboard = build_servers_keyboard(message.from_user.id)
-    
     await message.answer(
         "⚙️ **节点配置中心 (第一步)**\n\n请在下方悬浮菜单中选择你要操作的服务器：",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
 
-# ================= 🚀 第二步：选中服务器，展示文本与脚本清单 =================
+# ================= 🛠️ 辅助函数：【终极优化】一次握手，三合一极速探活 =================
+def check_all_scripts_status(instance_id: str, ip: str) -> dict:
+    """
+    ⚡️ 性能优化：1 次握手 + 重试机制 + 1 条拼接指令完成所有探测！
+    """
+    res = {"bbr": False, "xui": False, "mgui": False}
+    if not ip or ip in ["0.0.0.0", "阿里云分配IP中...", "未知IP"]:
+        return res
+        
+    pwd = getattr(config, 'SSH_PASSWORD', getattr(config, 'ROOT_PASSWORD', '@QS00008'))
+    if instance_id and instance_id.startswith("ssh_"):
+        try:
+            import db
+            custom_pwd = db.get_custom_server_password(instance_id)
+            if custom_pwd: pwd = custom_pwd
+        except Exception: pass
+
+    client = None
+    # ⭐ 核心铠甲：专门针对 SSH Banner 读取失败和连接拒绝的重试机制
+    for attempt in range(3):
+        try:
+            import paramiko
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            # 延长 banner_timeout 到 15 秒，给服务器喘息的时间
+            client.connect(
+                hostname=ip, port=22, username="root", password=pwd, 
+                timeout=8.0, banner_timeout=15.0, auth_timeout=8.0
+            )
+            # 如果连接成功，立刻跳出重试循环，往下执行
+            break 
+            
+        except Exception as conn_e:
+            if client: 
+                client.close()
+                client = None
+                
+            err_msg = str(conn_e).lower()
+            # 如果命中 Banner 报错或连接重置，等待 1.5 秒后重试
+            if attempt < 2 and ("banner" in err_msg or "closed" in err_msg or "refused" in err_msg):
+                time.sleep(1.5)
+                continue
+            else:
+                print(f"⚠️ [SSH连接彻底失败] IP: {ip} | 原因: {conn_e}")
+                return res
+
+    # 此时如果 client 还是为空，说明 3 次重试都失败了
+    if not client:
+        return res
+
+    try:
+        # ⭐ 核心删减法：用 bash 的 echo 打印特殊标识，一次性返回 3 个结果
+        combined_cmd = """
+        if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -qi bbr; then echo 'RES_bbr:1'; else echo 'RES_bbr:0'; fi
+        if systemctl is-active --quiet x-ui || test -f /usr/local/x-ui/x-ui; then echo 'RES_xui:1'; else echo 'RES_xui:0'; fi
+        if systemctl is-active --quiet mg-panel || systemctl is-active --quiet mgui || ps aux | grep -v grep | grep -qi mgui; then echo 'RES_mgui:1'; else echo 'RES_mgui:0'; fi
+        """
+        
+        stdin, stdout, stderr = client.exec_command(combined_cmd, timeout=5.0)
+        output = stdout.read().decode('utf-8')
+        
+        # 解析返回结果
+        for line in output.splitlines():
+            if "RES_bbr:1" in line: res["bbr"] = True
+            if "RES_xui:1" in line: res["xui"] = True
+            if "RES_mgui:1" in line: res["mgui"] = True
+            
+    except Exception as e:
+        print(f"⚠️ [SSH执行探活异常] IP: {ip} | 原因: {str(e)}")
+    finally:
+        if client:
+            client.close()
+            
+    return res
+
+# ================= 🚀 第二步：选中服务器，展示动态状态与脚本清单 =================
 @router.callback_query(F.data.startswith("srv_sel:"))
-async def show_script_options(call: CallbackQuery):
+async def show_script_options(call: types.CallbackQuery):
     try:
         _, instance_id = call.data.split(":")
     except ValueError:
@@ -127,53 +208,39 @@ async def show_script_options(call: CallbackQuery):
     servers = get_servers_data(call.from_user.id)
     srv = next((s for s in servers if s["instance_id"] == instance_id), None)
     
-    # ⭐ 核心补救优化：如果新扩容的机器还没来得及写入数据库，不要直接报错！
-    # 自动开启数据库全局强力查表，或者去本地库中匹配，不再拦截用户：
     if not srv:
-        try:
-            import sqlite3
-            db_path = getattr(config, 'DB_PATH', '/srv/aali/mg_core.db')
-            conn = sqlite3.connect(db_path, timeout=3.0)
-            cursor = conn.cursor()
-            for table in ["servers", "ecs_instances", "ecs_business", "instances"]:
-                try:
-                    cursor.execute(f"SELECT ip, region_id FROM {table} WHERE instance_id = ? LIMIT 1", (instance_id,))
-                    row = cursor.fetchone()
-                    if row:
-                        srv = {"instance_id": instance_id, "ip": row[0], "region": row[1]}
-                        break
-                except Exception:
-                    continue
-            conn.close()
-        except Exception:
-            pass
-            
-    # ⭐ 如果全库彻底真的还没存进去（刚建完前 1 秒），直接在内存里构建一个有效对象，绝不报错卡死！
-    if not srv:
-        srv = {
-            "instance_id": instance_id,
-            "ip": "刚扩容，请直接点击下发", 
-            "region": "cn-hongkong" # 默认兜底
-        }
+        srv = {"instance_id": instance_id, "ip": "8.217.219.166", "region": "cn-hongkong"}
         
-    region_id = srv.get("region", "未知地域")
+    region_id = srv.get("region", "cn-hongkong")
     region_name = REGION_MAP.get(region_id, region_id)
     public_ip = srv.get("ip", "0.0.0.0")
     
     if public_ip == "0.0.0.0" or not public_ip:
         public_ip = "⏳ 阿里云分配IP中..."
     
-    available_scripts = [
-        {"id": "bbr", "name": "🟢 bbr加速"},
-        {"id": "xui", "name": "🔴 x-ui面板"},
-        {"id": "mgui", "name": "🔴 MG 私有面板"},
+    raw_scripts = [
+        {"id": "bbr", "label": "bbr 加速"},
+        {"id": "xui", "label": "x-ui 面板"},
+        {"id": "mgui", "label": "MG 私有面板"},
     ]
     
-    builder = []
-    for script in available_scripts:
-        cb_data = f"run_sh:{script['id']}:{instance_id}"
-        builder.append([InlineKeyboardButton(text=script["name"], callback_data=cb_data)])
+    # ⭐ 性能优化：在此处仅发起 1 次后台线程，一次性拿到所有组件状态
+    status_dict = await asyncio.to_thread(check_all_scripts_status, instance_id, public_ip)
     
+    builder = []
+    for script in raw_scripts:
+        # 直接从刚才一次性获取的字典中读状态，0延迟
+        is_running = status_dict.get(script["id"], False)
+        
+        status_icon = "🟢" if is_running else "🔴"
+        button_text = f"{status_icon} {script['label']}"
+        cb_data = f"run_sh:{script['id']}:{instance_id}"
+        builder.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
+    
+    # ⭐ 核心逻辑：如果是自定义服务器 (不是 i- 开头)，则展示移除按钮
+    if not instance_id.startswith("i-"):
+        builder.append([InlineKeyboardButton(text="❌ 移除此自定义服务器", callback_data=f"del_custom_srv:{instance_id}")])
+
     builder.append([InlineKeyboardButton(text="🔙 返回服务器列表", callback_data="back_to_srv_list")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=builder)
     
@@ -182,7 +249,7 @@ async def show_script_options(call: CallbackQuery):
         f"选中实例: `{instance_id}`\n"
         f"所属地域: {region_name}\n"
         f"公网IP：`{public_ip}`\n\n"
-        f"👉 请选择要向该服务器下发的 Shell 脚本：",
+        f"👉 请选择要向该服务器下发的 Shell 脚本 *(🟢运行中 / 🔴未安装)*：",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -190,7 +257,7 @@ async def show_script_options(call: CallbackQuery):
 
 # ================= ↩️ 附加步：返回按钮逻辑 =================
 @router.callback_query(F.data == "back_to_srv_list")
-async def back_to_servers(call: CallbackQuery):
+async def back_to_servers(call: types.CallbackQuery):
     keyboard = build_servers_keyboard(call.from_user.id)
     await call.message.edit_text(
         "⚙️ **节点配置中心 (第一步)**\n\n请在下方悬浮菜单中选择你要操作的服务器：",
@@ -198,3 +265,88 @@ async def back_to_servers(call: CallbackQuery):
         parse_mode="Markdown"
     )
     await call.answer()
+
+# ================= ❌ 删除自定义服务器逻辑 =================
+@router.callback_query(F.data.startswith("del_custom_srv:"))
+async def process_del_custom_server(call: types.CallbackQuery):
+    instance_id = call.data.split(":")[-1]
+    
+    try:
+        import db
+        db.delete_custom_server(instance_id)
+    except Exception as e:
+        return await call.answer(f"删除失败: {e}", show_alert=True)
+    
+    await call.answer("❌ 自定义服务器已彻底从控制台移除！", show_alert=True)
+    
+    await call.message.edit_text(
+        f"✅ **操作成功**\n\n"
+        f"实例 `{instance_id}` 的本地信息及业务计费数据已抹除。\n\n"
+        f"*(此操作仅解除机器人的管控，不影响服务器本身的运行)*",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 返回节点配置列表", callback_data="back_to_srv_list")]
+        ]),
+        parse_mode="Markdown"
+    )
+
+# =====================================================================
+# ================= ➕ 添加自定义服务器逻辑 (FSM) =====================
+# =====================================================================
+
+# 1. 拦截“添加”按钮点击
+@router.callback_query(F.data == "custom_srv:add")
+async def add_custom_server_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != config.ADMIN_ID:
+        return await call.answer("权限不足！", show_alert=True)
+        
+    await state.set_state(MguiAddServerFSM.wait_for_ip)
+    await call.message.answer("➕ **添加自定义服务器 (SSH)**\n\n🌐 请输入服务器的公网 IP 地址：\n*(回复 0 取消操作)*", parse_mode="Markdown")
+    await call.answer()
+
+# 2. 接收 IP
+@router.message(MguiAddServerFSM.wait_for_ip)
+async def add_custom_server_ip(message: types.Message, state: FSMContext):
+    ip = message.text.strip()
+    if ip == '0':
+        await state.clear()
+        return await message.answer("已取消操作。")
+        
+    await state.update_data(ip=ip)
+    await state.set_state(MguiAddServerFSM.wait_for_pwd)
+    await message.answer(f"✅ IP `{ip}` 已记录。\n\n🔑 请输入该服务器的 Root 密码：\n*(回复 0 取消操作)*", parse_mode="Markdown")
+
+# 3. 接收密码并存库
+@router.message(MguiAddServerFSM.wait_for_pwd)
+async def add_custom_server_pwd(message: types.Message, state: FSMContext):
+    pwd = message.text.strip()
+    if pwd == '0':
+        await state.clear()
+        return await message.answer("已取消操作。")
+
+    data = await state.get_data()
+    ip = data['ip']
+    
+    # ⭐ 核心：生成不以 i- 开头的虚拟 instance_id，以区分阿里云机器
+    instance_id = f"ssh_{ip.replace('.', '_')}" 
+
+    try:
+        import db
+        db.add_custom_server(instance_id, ip, pwd)
+        await state.clear()
+        
+        # 给一个单独的返回按钮，指向 node.py 原本的返回第一步的回调 "back_to_srv_list"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 刷新节点配置列表", callback_data="back_to_srv_list")]
+        ])
+        
+        await message.answer(
+            f"🎉 **自定义服务器添加成功！**\n\n"
+            f"🌐 IP: `{ip}`\n"
+            f"🆔 实例标识: `{instance_id}`\n\n"
+            f"已无缝接入节点配置中心，请点击下方按钮刷新面板。",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        await message.answer(f"❌ 添加失败，可能是数据库写入异常: {e}")

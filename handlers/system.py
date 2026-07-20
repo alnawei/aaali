@@ -8,6 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import FSInputFile
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import CallbackQuery
 import db
 import config
 
@@ -158,17 +159,6 @@ async def receive_new_password(message: types.Message, state: FSMContext):
 
 # ================= 5. 启动模板管理 =================
 
-def get_sys_region_main_menu():
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🇭🇰 中国香港", callback_data="sys_region_cn-hongkong_中国香港"))
-    builder.row(
-        InlineKeyboardButton(text="🌏 亚洲地区", callback_data="sys_tpl_asia"),
-        InlineKeyboardButton(text="🌍 欧美地区", callback_data="sys_tpl_eu_us")
-    )
-    builder.row(InlineKeyboardButton(text="🐪 中东及其他", callback_data="sys_tpl_others"))
-    builder.row(InlineKeyboardButton(text="🔙 返回系统设置", callback_data="back_to_sys"))
-    return builder.as_markup()
-
 def get_sys_region_asia_menu():
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -177,7 +167,43 @@ def get_sys_region_asia_menu():
     )
     builder.row(
         InlineKeyboardButton(text="🇸🇬 新加坡", callback_data="sys_region_ap-southeast-1_新加坡"),
-        InlineKeyboardButton(text="🇲🇾 吉隆坡", callback_data="sys_region_ap-southeast-3_马来西亚吉隆坡")
+        InlineKeyboardButton(text="🇲🇾 马来西亚(吉隆坡)", callback_data="sys_region_ap-southeast-3_马来西亚吉隆坡")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇲🇾 马来西亚(柔佛州)", callback_data="sys_region_ap-southeast-x_马来西亚柔佛州"),
+        InlineKeyboardButton(text="🇮🇩 印尼(雅加达)", callback_data="sys_region_ap-southeast-5_印尼雅加达")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇵🇭 菲律宾(马尼拉)", callback_data="sys_region_ap-southeast-6_菲律宾马尼拉"),
+        InlineKeyboardButton(text="🇹🇭 泰国(曼谷)", callback_data="sys_region_ap-southeast-7_泰国曼谷")
+    )
+    builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="sys_tpl_main"))
+    return builder.as_markup()
+
+# ================= 🌍 欧洲与美洲子菜单 =================
+def get_sys_region_eu_us_menu():
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🇩🇪 德国(法兰克福)", callback_data="sys_region_eu-central-1_德国法兰克福"),
+        InlineKeyboardButton(text="🇬🇧 英国(伦敦)", callback_data="sys_region_eu-west-1_英国伦敦")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇫🇷 法国(巴黎)", callback_data="sys_region_eu-central-x_法国巴黎"),
+        InlineKeyboardButton(text="🇺🇸 美国(硅谷)", callback_data="sys_region_us-west-1_美国硅谷")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🇺🇸 美国(弗吉尼亚)", callback_data="sys_region_us-east-1_美国弗吉尼亚"),
+        InlineKeyboardButton(text="🇲🇽 墨西哥", callback_data="sys_region_na-mexico-x_墨西哥")
+    )
+    builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="sys_tpl_main"))
+    return builder.as_markup()
+
+# ================= 🐪 中东子菜单 =================
+def get_sys_region_others_menu():
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🇦🇪 阿联酋(迪拜)", callback_data="sys_region_me-east-1_阿联酋迪拜"),
+        InlineKeyboardButton(text="🇸🇦 沙特(利雅得)", callback_data="sys_region_me-central-1_沙特利雅得")
     )
     builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="sys_tpl_main"))
     return builder.as_markup()
@@ -193,6 +219,18 @@ async def show_sys_tpl_asia(callback: types.CallbackQuery):
     if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     await callback.answer()
     await callback.message.edit_text("🌏 **亚洲地区 - 模板管理**\n\n请选择具体地域：", reply_markup=get_sys_region_asia_menu(), parse_mode="Markdown")
+
+# 拦截【欧美地区】的点击
+@router.callback_query(F.data == "sys_tpl_eu_us")
+async def show_eu_us_menu(call: CallbackQuery):
+    await call.message.edit_text("🌍 请选择欧美地区的具体节点：", reply_markup=get_sys_region_eu_us_menu())
+    await call.answer()
+
+# 拦截【中东及其他】的点击
+@router.callback_query(F.data == "sys_tpl_others")
+async def show_others_menu(call: CallbackQuery):
+    await call.message.edit_text("🐪 请选择中东及其他地区的具体节点：", reply_markup=get_sys_region_others_menu())
+    await call.answer()
 
 @router.callback_query(F.data.startswith("sys_region_"))
 async def manage_specific_region(callback: types.CallbackQuery, state: FSMContext):

@@ -35,14 +35,14 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RECIPIENT = os.getenv("RECIPIENT", "")
 
 # ==========================================
-# 阿里云 ECS 核心凭证 (必填校验)
-# ==========================================
-ALIYUN_ACCESS_KEY_ID = os.getenv("ALIYUN_ACCESS_KEY_ID")
-ALIYUN_ACCESS_KEY_SECRET = os.getenv("ALIYUN_ACCESS_KEY_SECRET")
+# # 阿里云 ECS 核心凭证 (必填校验)
+# # ==========================================
+# ALIYUN_ACCESS_KEY_ID = os.getenv("ALIYUN_ACCESS_KEY_ID")
+# ALIYUN_ACCESS_KEY_SECRET = os.getenv("ALIYUN_ACCESS_KEY_SECRET")
 
-if not ALIYUN_ACCESS_KEY_ID or not ALIYUN_ACCESS_KEY_SECRET:
-    logger.critical("❌ 致命错误: 阿里云 AccessKey 凭证缺失！请在 .env 中填入完整 API 密钥。")
-    raise ValueError("Missing Aliyun AccessKey credentials.")
+# if not ALIYUN_ACCESS_KEY_ID or not ALIYUN_ACCESS_KEY_SECRET:
+#     logger.critical("❌ 致命错误: 阿里云 AccessKey 凭证缺失！请在 .env 中填入完整 API 密钥。")
+#     raise ValueError("Missing Aliyun AccessKey credentials.")
 
 # ==========================================
 # 统一收口管理文件与数据库路径

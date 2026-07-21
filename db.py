@@ -4,7 +4,9 @@ import logging
 from datetime import datetime
 import config  # 统一从 config 获取配置与路径
 import os
+from dotenv import load_dotenv
 from config import DB_PATH # 确保导入了你的数据库路径
+
 DB_PATH = config.DB_PATH  # ⭐ 就是加在这里！导出给 tasks.py 等外部模块调用
 
 logger = logging.getLogger("MG_Bot.DB")
@@ -25,6 +27,19 @@ def init_db():
         
         # ⭐ 核心性能优化：开启 SQLite WAL (预写式日志) 模式，大幅提高异步并发读写能力
         cursor.execute("PRAGMA journal_mode=WAL;")
+
+        # ==================== 0. 资产数量统计表 (修复缺失) ====================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS account_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER,
+                region_id TEXT,
+                running_count INTEGER DEFAULT 0,
+                stopped_count INTEGER DEFAULT 0,
+                last_sync_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(account_id, region_id)
+            )
+        """)
         
         # ==================== 1. 云账号凭证表 (新增) ====================
         cursor.execute("""
@@ -84,14 +99,22 @@ def init_db():
         # 写入默认全局重装密码
         cursor.execute("INSERT OR IGNORE INTO sys_config (key, value) VALUES ('default_password', '@QS00008')")
         
-        # 自动写入一个默认的主账号占位符 (防止老代码报错)
+        # 🌟 终极修复：直接告诉系统 .env 文件的绝对位置！(请确保你的 .env 确实在这个路径下)
+        load_dotenv("/srv/Ali/.env") 
+        
+        # 此时肯定能读到真实的密钥了
+        real_ak = os.getenv("ALIYUN_ACCESS_KEY_ID", "请修改AK")
+        real_sk = os.getenv("ALIYUN_ACCESS_KEY_SECRET", "请修改SK")
+        
+        # 强制覆盖更新
         cursor.execute("""
-            INSERT OR IGNORE INTO cloud_accounts (id, alias, access_key, access_secret) 
-            VALUES (1, '默认主账号', '请修改AK', '请修改SK')
-        """)
+            REPLACE INTO cloud_accounts (id, alias, access_key, access_secret, is_active) 
+            VALUES (1, '默认主账号', ?, ?, 1)
+        """, (real_ak, real_sk))
         
         conn.commit()
         logger.info("✅ 数据库表结构与 WAL 高并发优化模式已成功加载 (多账号版)！")
+
     except Exception as e:
         logger.error(f"❌ 数据库初始化失败: {e}")
         raise e
@@ -101,19 +124,21 @@ def init_db():
 def get_active_servers(user_id: int = 0) -> list:
     """
     查询本地所有在管服务器列表。
-    为适应 node.py，返回字典列表: [{'instance_id':..., 'name':..., 'region':..., 'ip':...}]
+    🌟 修复：已补全 account_id 的拉取，确保 node.py 能正确分组
     """
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT instance_id, name, region_id, ip FROM ecs_business")
+        # 增加 account_id 字段
+        cursor.execute("SELECT instance_id, name, region_id, ip, account_id FROM ecs_business")
         rows = cursor.fetchall()
         return [
             {
                 "instance_id": r[0],
                 "name": r[1] or f"实例-{r[0][-4:]}",
                 "region": r[2] or "cn-hongkong",
-                "ip": r[3] or "0.0.0.0"
+                "ip": r[3] or "0.0.0.0",
+                "account_id": r[4] or 1  # 兜底给个默认主账号ID 1
             }
             for r in rows
         ]
@@ -179,7 +204,8 @@ def get_business_data(instance_id: str) -> dict:
 
 def update_business_data(instance_id: str, field: str, value):
     """通用单字段更新函数，带有 SQL 白名单保护"""
-    ALLOWED_FIELDS = ['name', 'region_id', 'ip', 'reset_day', 'traffic_limit_gb', 'expire_time', 'traffic_start_time']
+    # 🌟 修复：白名单新增 account_id
+    ALLOWED_FIELDS = ['name', 'region_id', 'ip', 'reset_day', 'traffic_limit_gb', 'expire_time', 'traffic_start_time', 'account_id']
     if field not in ALLOWED_FIELDS:
         logger.error(f"非法尝试修改非白名单字段: {field}")
         raise ValueError(f"Invalid field name: {field}")

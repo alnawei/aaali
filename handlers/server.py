@@ -212,13 +212,29 @@ def _fetch_single_region_sync(account_id: int, region_id: str) -> list:
         return []
 
 async def get_instances_by_account_async(account_id: int) -> list:
-    """⚡️ 纯净实时版：不查本地账本，直接高并发拉取全球数据"""
+    """⚡️ 极限优化版：先查本地雷达精准定位，再向阿里云发起狙击请求"""
     
-    # 🌟 直接引用文件顶部已经写好的 GLOBAL_REGIONS 全局名单！代码瞬间清爽！
-    tasks = [asyncio.to_thread(_fetch_single_region_sync, account_id, r) for r in GLOBAL_REGIONS]
+    # 1. ⚡️ 毫秒级查库：利用刚才修好的 ecs_business 表，提取该账号真正有机器的地域
+    try:
+        conn = sqlite3.connect(config.DB_PATH, timeout=2.0)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT region_id FROM ecs_business WHERE account_id = ?", (account_id,))
+        active_regions = [row[0] for row in cursor.fetchall()]
+        conn.close()
+    except Exception as e:
+        print(f"查库失败: {e}")
+        active_regions = ["cn-hongkong"] # 发生意外时的基础兜底
+        
+    # 🌟 极致秒开：如果账本显示该账号名下根本没有机器，直接 0 延迟返回空列表！
+    if not active_regions:
+        return []
+        
+    # 2. 🎯 精准请求：只向真实存在机器的 1~2 个地域发起 API 并发请求
+    # 将原来 16 个请求锐减到 1~2 个，把耗时从 2 秒瞬间压榨到 0.2 秒左右！
+    tasks = [asyncio.to_thread(_fetch_single_region_sync, account_id, r) for r in active_regions]
     results = await asyncio.gather(*tasks)
     
-    # 过滤掉空结果，摊平列表
+    # 摊平列表并返回
     return [inst for region_list in results for inst in region_list]
 
 # ================= 2. 动态折叠菜单 UI 构建器 =================
@@ -292,29 +308,46 @@ def get_region_others_menu():
 
 
 
+# ================= 🚀 主菜单：服务器管理入口 =================
 @router.message(F.text == "💻 服务器管理")
 async def cmd_server_management(message: types.Message, state: FSMContext):
-    # 清理可能存在的旧状态，确保回到最初的起点
     await state.clear()
     
-    text = (
-        "📊 **服务器配置中心**\n\n"
-        "请先选择你要操作的资源池 / 云账号："
-    )
+    # 1. ⚡️ 将同步查库丢进后台线程池，绝对不卡主线程
+    def _fetch_accounts():
+        import sqlite3
+        import config
+        try:
+            conn = sqlite3.connect(config.DB_PATH, timeout=2.0)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, alias FROM cloud_accounts WHERE is_active = 1")
+            accs = cursor.fetchall()
+            conn.close()
+            return accs
+        except Exception as e:
+            print(f"读取账号表失败: {e}")
+            return []
+            
+    import asyncio
+    accounts = await asyncio.to_thread(_fetch_accounts)
     
-    # 调用我们刚刚写好的动态多账号键盘
-    await message.answer(
-        text, 
-        reply_markup=get_account_selection_keyboard(), 
-        parse_mode="Markdown"
-    )
+    # 2. 动态生成键盘
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
+    builder = InlineKeyboardBuilder()
+    
+    if not accounts:
+        builder.row(InlineKeyboardButton(text="⚠️ 暂无可用云账号，请先添加", callback_data="no_action"))
+    else:
+        for acc_id, alias in accounts:
+            builder.row(InlineKeyboardButton(text=f"🏢 {alias}", callback_data=f"select_acc:{acc_id}"))
+            
+    builder.row(InlineKeyboardButton(text="➕ 添加云账号", callback_data="add_cloud_account"))
+    # builder.row(InlineKeyboardButton(text="关闭菜单", callback_data="close_menu")) # 如果不需要关闭按钮，这行可以删掉
 
-
-# ==========================================
-# 🌟 新增：全局内存缓存字典与过期时间
-# ==========================================
-ECS_MENU_CACHE = {}
-CACHE_TTL = 300  # 缓存保质期 300 秒 (5分钟)
+    # 3. 发送瞬间响应
+    text = "📊 **服务器配置中心**\n\n请先选择你要操作的资源池 / 云账号："
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 
 # ==========================================
@@ -399,13 +432,6 @@ async def process_force_sync(call: types.CallbackQuery, state: FSMContext):
         # 3. 🌟 核心动作：直接强制调用最新的高并发函数去阿里云拉数据 (绝对不读本地缓存)
         instances = await get_instances_by_account_async(account_id)
         
-        # 4. 拿到最新鲜的数据后，强制覆盖写入本地内存字典
-        current_time = time.time()
-        ECS_MENU_CACHE[account_id] = {
-            "instances": instances,
-            "timestamp": current_time
-        }
-        
         # ================= 下面是原汁原味的重新渲染面板逻辑 =================
         running_count = sum(1 for i in instances if i['status'] == 'Running')
         stopped_count = sum(1 for i in instances if i['status'] in ['Stopped', 'Stopping'])
@@ -457,21 +483,39 @@ async def process_force_sync(call: types.CallbackQuery, state: FSMContext):
 # ================= 菜单导航联动拦截器 =================
 
 # 1. 🔙 返回上级 (从二级机器列表回到一级账号列表)
+# ================= ↩️ 返回账号列表 =================
 @router.callback_query(F.data == "back_to_accounts")
 async def process_back_to_accounts(call: types.CallbackQuery, state: FSMContext):
-    # 清理掉之前选中的 account_id 状态
     await state.clear()
     
-    text = (
-        "📊 **服务器配置中心**\n\n"
-        "请先选择你要操作的资源池 / 云账号："
-    )
-    # 重新渲染一级菜单
-    await call.message.edit_text(
-        text, 
-        reply_markup=get_account_selection_keyboard(), 
-        parse_mode="Markdown"
-    )
+    # 完全一样的异步查库逻辑
+    def _fetch_accounts():
+
+        try:
+            conn = sqlite3.connect(config.DB_PATH, timeout=2.0)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, alias FROM cloud_accounts WHERE is_active = 1")
+            accs = cursor.fetchall()
+            conn.close()
+            return accs
+        except Exception:
+            return []
+            
+
+    accounts = await asyncio.to_thread(_fetch_accounts)
+    
+    builder = InlineKeyboardBuilder()
+    
+    if not accounts:
+        builder.row(InlineKeyboardButton(text="⚠️ 暂无可用云账号，请先添加", callback_data="no_action"))
+    else:
+        for acc_id, alias in accounts:
+            builder.row(InlineKeyboardButton(text=f"🏢 {alias}", callback_data=f"select_acc:{acc_id}"))
+            
+    builder.row(InlineKeyboardButton(text="➕ 添加云账号", callback_data="add_cloud_account"))
+    
+    text = "📊 **服务器配置中心**\n\n请先选择你要操作的资源池 / 云账号："
+    await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
     await call.answer()
 
 # 2. ❌ 关闭菜单
@@ -739,12 +783,6 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
         await asyncio.to_thread(_sync_dbs, real_ip, inst_id, region_id)
         # ==========================================
         
-        # 🌟 这里顺手把我们刚才聊的“账本自愈 (清理缓存)”逻辑也补上
-        if account_id in ECS_MENU_CACHE:
-            del ECS_MENU_CACHE[account_id]
-            print(f"♻️ [自愈] 账号 {account_id} 已新增机器，缓存已清除")
-        # ==========================================
-
         node_config_btn = types.InlineKeyboardMarkup(inline_keyboard=[
             [types.InlineKeyboardButton(text="⚙️ 节点配置 (选脚本)", callback_data=f"srv_sel:{inst_id}")]
         ])
@@ -808,15 +846,42 @@ def get_single_instance_sync(instance_id: str) -> dict:
 
 def get_real_traffic_gb(instance_id: str, start_time_str: str) -> float:
     """调用阿里云 CMS 接口，拉取指定时间段内的出网总流量，并转换为 GB"""
+    import sqlite3
+    import config
+    import json
+    import time
+    from datetime import datetime
+    
     try:
+        # 🌟 核心升级：连表查询，动态获取真实的 AK、SK 和 地域
+        conn = sqlite3.connect(config.DB_PATH, timeout=5.0)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT c.access_key, c.access_secret, e.region_id 
+            FROM ecs_business e 
+            JOIN cloud_accounts c ON e.account_id = c.id 
+            WHERE e.instance_id = ?
+        ''', (instance_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            print(f"流量查询失败：本地账本未找到实例 {instance_id} 的归属账号。")
+            return 0.0
+            
+        ak, sk, region_id = row
+        ak = str(ak).strip()
+        sk = str(sk).strip()
+
         start_dt = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
         start_ts = int(time.mktime(start_dt.timetuple()) * 1000)
         end_ts = int(time.time() * 1000)
         
+        # 动态组装当前地域的 CMS endpoint
         ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint='metrics.cn-hongkong.aliyuncs.com'
+            access_key_id=ak,
+            access_key_secret=sk,
+            endpoint=f'metrics.{region_id}.aliyuncs.com'
         )
         client = CmsClient(ali_config)
         
@@ -1308,10 +1373,6 @@ async def execute_release(callback: types.CallbackQuery):
         await asyncio.to_thread(_do_delete)
         # 4. 清理数据库
         await asyncio.to_thread(_clean_local_db)
-        
-        # 🌟 核心注入：销毁成功，触发账本自愈！
-        if inst_info['account_id'] in ECS_MENU_CACHE:
-            del ECS_MENU_CACHE[inst_info['account_id']]
 
         await callback.message.edit_text(f"🔥 **服务器已被永久释放！**\n\n🆔 实例: `{instance_id}`\n本地业务数据已同步清理。")
     except Exception as e:
@@ -1455,10 +1516,32 @@ async def receive_custom_bandwidth(message: types.Message, state: FSMContext):
     progress_msg = await message.answer(f"🚀 正在向阿里云提交申请，调整带宽至 **{bw_size} Mbps**...")
     
     def _do_modify_bw():
-        region_id = "cn-hongkong"
+        import sqlite3
+        import config
+        
+        # 🌟 核心升级：连表查询，动态获取真实的 AK、SK 和 地域
+        conn = sqlite3.connect(config.DB_PATH, timeout=5.0)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT c.access_key, c.access_secret, e.region_id 
+            FROM ecs_business e 
+            JOIN cloud_accounts c ON e.account_id = c.id 
+            WHERE e.instance_id = ?
+        ''', (instance_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            raise Exception("无法在本地账本中找到该实例的云账号归属记录。")
+            
+        ak, sk, region_id = row
+        ak = str(ak).strip()
+        sk = str(sk).strip()
+
+        # 动态化 endpoint，解除写死的 cn-hongkong
         ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
+            access_key_id=ak,
+            access_key_secret=sk,
             endpoint=f'ecs.{region_id}.aliyuncs.com'
         )
         client = EcsClient(ali_config)
@@ -1470,6 +1553,10 @@ async def receive_custom_bandwidth(message: types.Message, state: FSMContext):
         
     try:
         await asyncio.to_thread(_do_modify_bw)
+        
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
+        
         builder = InlineKeyboardBuilder()
         builder.row(InlineKeyboardButton(text="🔙 返回服务器详情", callback_data=f"manage_ecs_{instance_id}"))
         

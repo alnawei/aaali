@@ -2,40 +2,51 @@ import os
 import time
 import base64
 import sqlite3
+import asyncio  # 引入异步库，兼容 aiogram 异步架构
 from alibabacloud_tea_openapi import models as open_api_models
 from alibabacloud_ecs20140526.client import Client as EcsClient
 from alibabacloud_ecs20140526 import models as ecs_models
+import re
 
 # ================= 配置区 =================
-# 数据库路径 (对应你 config.DB_PATH)
-DB_PATH = "bot_data.db" 
+DB_PATH = "/srv/Ali/bot_data.db" 
 
-# 想要一键开荒的地域列表 (可随意增删)
-TARGET_REGIONS = [
-    "cn-hongkong",      # 中国香港
-    # "ap-northeast-1", # 日本东京
-    # "ap-southeast-1", # 新加坡
-]
+# 🌟 全局 16 大地域映射表（名称对齐面板）
+REGION_MAP = {
+    "cn-hongkong": "中国香港", "ap-northeast-1": "日本(东京)", "ap-northeast-2": "韩国(首尔)",
+    "ap-southeast-1": "新加坡", "ap-southeast-3": "马来西亚(吉隆坡)", "ap-southeast-5": "印尼(雅加达)",
+    "ap-southeast-6": "菲律宾(马尼拉)", "ap-southeast-7": "泰国(曼谷)", "eu-central-1": "德国(法兰克福)",
+    "eu-west-1": "英国(伦敦)", "us-west-1": "美国(硅谷)", "us-east-1": "美国(弗吉尼亚)", 
+    "me-east-1": "阿联酋(迪拜)", "me-central-1": "沙特(利雅得)", "na-south-1": "墨西哥"
+}
 
-# 🎯 终极基座配置 (完美兼容你的“无定时维护”架构)
+# 取出所有 region_id 作为开荒目标列表
+TARGET_REGIONS = list(REGION_MAP.keys())
+
+# 🎯 终极基座配置
 INSTANCE_TYPE = "ecs.e-c1m1.large"
 IMAGE_ID = "debian_12_14_x64_20G_alibase_20260609.vhd"
-ROOT_PASSWORD = "@QS00008" # ⚠️ 生产环境记得修改
+ROOT_PASSWORD = "@QS00008" 
 # ==========================================
 
 # 🛠️ 客户端工厂
 def create_client(region_id, ak, sk) -> EcsClient:
     """初始化动态阿里云 API 客户端"""
+    
+    # 🌟 终极防御：自动剔除 AK/SK 中所有非英文字母和数字的字符（比如误复制的中文、换行、空格）
+    clean_ak = re.sub(r'[^a-zA-Z0-9]', '', str(ak))
+    clean_sk = re.sub(r'[^a-zA-Z0-9]', '', str(sk))
+    
     config = open_api_models.Config(
-        access_key_id=ak,
-        access_key_secret=sk,
+        access_key_id=clean_ak,
+        access_key_secret=clean_sk,
         region_id=region_id
     )
     # 统一使用 ECS Endpoint
     config.endpoint = f"ecs.{region_id}.aliyuncs.com"
     return EcsClient(config)
 
-# 🛠️ 核心开荒逻辑 (融合了 test_init_hk.py 的精华)
+# 🛠️ 核心开荒逻辑
 def init_region_for_account(account_id, alias, ak, sk, region_id):
     print(f"\n🚀 [账号: {alias}] 开始初始化地域: {region_id}")
     client = create_client(region_id, ak, sk)
@@ -133,44 +144,59 @@ def init_region_for_account(account_id, alias, ak, sk, region_id):
             print(f"   🎉 [安全组] 创建并配置成功: {sg_id}")
 
         # ---------------- 5. 组装 LaunchTemplate ----------------
+        # ---------------- 5. 组装 LaunchTemplate (先查后建) ----------------
         template_name = f"Node-Template-Acc{account_id}-{region_id}"
-        
-        # 定义基础环境脚本 (包含密码注入)
-        boot_script = f"""#!/bin/bash
-        echo "root:{ROOT_PASSWORD}" | chpasswd
-        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
-        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
-        systemctl restart sshd
-        apt-get update -y
-        apt-get install -y curl wget git
-        echo "Node {region_id} initialized successfully!" > /root/init.log
-        """
-        user_data_b64 = base64.b64encode(boot_script.encode('utf-8')).decode('utf-8')
+        template_id = None
 
-        print("   ⏳ [启动模板] 正在拼装完美图纸...")
-        system_disk_config = ecs_models.CreateLaunchTemplateRequestSystemDisk(category='cloud_essd', size=20, delete_with_instance=True)
+        # 🔍 1. 先查询阿里云端是否已经存在这个模板（防止之前建好了但本地忘了）
+        req_lt = ecs_models.DescribeLaunchTemplatesRequest(region_id=region_id)
+        resp_lt = client.describe_launch_templates(req_lt)
+        lt_sets = getattr(resp_lt.body, 'launch_template_sets', None)
+        lt_list = getattr(lt_sets, 'launch_template_set', []) if lt_sets else []
+
+        for lt in lt_list:
+            if getattr(lt, 'launch_template_name', '') == template_name:
+                template_id = getattr(lt, 'launch_template_id', None)
+                break
+
+        if template_id:
+            print(f"   ✅ [启动模板] 发现云端已存在遗留模板，直接认领: {template_id}")
+        else:
+            # 2. 如果云端没有，才真正去拼装和创建
+            boot_script = f"""#!/bin/bash
+            echo "root:{ROOT_PASSWORD}" | chpasswd
+            sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+            sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+            systemctl restart sshd
+            apt-get update -y
+            apt-get install -y curl wget git
+            echo "Node {region_id} initialized successfully!" > /root/init.log
+            """
+            user_data_b64 = base64.b64encode(boot_script.encode('utf-8')).decode('utf-8')
+
+            print("   ⏳ [启动模板] 正在拼装完美图纸并创建...")
+            system_disk_config = ecs_models.CreateLaunchTemplateRequestSystemDisk(category='cloud_essd', size=20, delete_with_instance=True)
+            
+            create_lt_req = ecs_models.CreateLaunchTemplateRequest(
+                region_id=region_id,
+                launch_template_name=template_name,
+                image_id=IMAGE_ID,
+                instance_type=INSTANCE_TYPE,
+                instance_name=f"Node-Acc{account_id}", 
+                internet_max_bandwidth_out=5,
+                internet_charge_type="PayByTraffic",
+                instance_charge_type="PostPaid",
+                user_data=user_data_b64,
+                system_disk=system_disk_config,
+                security_group_id=sg_id,
+                v_switch_id=vswitch_id
+            )
+            
+            create_lt_resp = client.create_launch_template(create_lt_req)
+            template_id = create_lt_resp.body.launch_template_id
+            print(f"   🎉 [启动模板] 新建成功: {template_id}")
         
-        # 💡 使用最稳妥的扁平结构，摒弃 TemplateResource 字典
-        create_lt_req = ecs_models.CreateLaunchTemplateRequest(
-            region_id=region_id,
-            launch_template_name=template_name,
-            image_id=IMAGE_ID,
-            instance_type=INSTANCE_TYPE,
-            instance_name=f"Node-Acc{account_id}", 
-            internet_max_bandwidth_out=5,
-            internet_charge_type="PayByTraffic",
-            instance_charge_type="PostPaid",
-            user_data=user_data_b64,
-            system_disk=system_disk_config,
-            security_group_id=sg_id,
-            v_switch_id=vswitch_id
-        )
-        
-        create_lt_resp = client.create_launch_template(create_lt_req)
-        template_id = create_lt_resp.body.launch_template_id
-        print(f"   🎉 [启动模板] 成功: {template_id}")
-        
-        # 存入数据库
+        # 3. 最终存入数据库
         save_template_to_db(account_id, region_id, template_id)
         return True
 
@@ -178,35 +204,59 @@ def init_region_for_account(account_id, alias, ak, sk, region_id):
         print(f"   ❌ [账号: {alias}] 地域 {region_id} 初始化失败: {str(e)}")
         return False
 
-# 🛠️ 数据库持久化逻辑
+
+# 🛠️ 数据库持久化逻辑 (增强版)
 def save_template_to_db(account_id, region_id, template_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS launch_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER,
-            region_id TEXT,
-            template_id TEXT,
-            UNIQUE(account_id, region_id)
-        )
-    """)
-    cursor.execute("""
-        INSERT INTO launch_templates (account_id, region_id, template_id)
-        VALUES (?, ?, ?)
-        ON CONFLICT(account_id, region_id) DO UPDATE SET template_id=excluded.template_id
-    """, (account_id, region_id, template_id))
-    conn.commit()
-    conn.close()
-    print(f"   💾 模板 ID [{template_id}] 已安全入库！")
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+    try:
+        cursor = conn.cursor()
+        
+        # 🌟 修复 1：补全 region_name 字段，与 db.py 保持 100% 一致
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS launch_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER,
+                region_id TEXT,
+                region_name TEXT,
+                template_id TEXT,
+                UNIQUE(account_id, region_id)
+            )
+        """)
+        
+        # 🌟 修复 2：写入时提取对应的中文名称
+        r_name = REGION_MAP.get(region_id, region_id)
+        
+        cursor.execute("""
+            INSERT INTO launch_templates (account_id, region_id, region_name, template_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(account_id, region_id) DO UPDATE SET 
+                template_id=excluded.template_id,
+                region_name=excluded.region_name
+        """, (account_id, region_id, r_name, template_id))
+        
+        conn.commit()
+        print(f"   💾 账本同步成功 -> 路径: {DB_PATH} | 模板 ID: [{template_id}] 已安全落盘！")
+    except Exception as dbe:
+        print(f"   ❌ 写入 SQLite 资产账本失败: {dbe}")
+        conn.rollback()
+    finally:
+        conn.close()
 
 # 🛠️ 批量执行框架
 def run_all():
     print("====== 开始多账号全局自动化部署基建 ======")
+    print(f"📋 当前锁定目标资产账本路径: {DB_PATH}")
+    
+    # 检查数据库目录是否存在，不存在则提前创建，防止抛出 FileNotFoundError
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
         cursor = conn.cursor()
-        # 确保基础表存在
+        # 初始化基础表
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS launch_templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,6 +266,14 @@ def run_all():
                 UNIQUE(account_id, region_id)
             )
         """)
+        conn.commit()
+        
+        # 检查 cloud_accounts 表是否存在（兜底）
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cloud_accounts';")
+        if not cursor.fetchone():
+            conn.close()
+            return False, "❌ 账本异常：未找到 cloud_accounts 表，请先在机器人控制台登记阿里云 API 密钥。"
+
         cursor.execute("SELECT id, alias, access_key, access_secret FROM cloud_accounts WHERE is_active = 1")
         accounts = cursor.fetchall()
     except Exception as e:
@@ -223,6 +281,7 @@ def run_all():
         return False, f"数据库读取失败: {e}"
     
     if not accounts:
+        conn.close()
         return False, "未找到任何激活的云账号，请先在 Telegram 里添加账号。"
     
     success_logs = []

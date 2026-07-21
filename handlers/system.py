@@ -9,9 +9,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import FSInputFile, Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
+
 import db
 import config
 import init_regions
+import sync_assets # 导入你写的脚本
+from config import DB_PATH
+import io
+import sys
 
 
 router = Router()
@@ -30,7 +35,6 @@ class TemplateFSM(StatesGroup):
 # ================= 🛠️ 工具函数：SQLite 安全一致性备份 =================
 def create_safe_backup_sync(src_path: str, dst_path: str) -> bool:
     """底层使用 sqlite3官方热备份接口，防止读取热写入锁导致文件损坏或锁冲突"""
-    import sqlite3
     try:
         src = sqlite3.connect(src_path)
         dst = sqlite3.connect(dst_path)
@@ -131,11 +135,7 @@ async def execute_sync_assets(callback: types.CallbackQuery):
     await callback.answer()
     
     # 包装执行逻辑，捕获输出
-    def _run_sync():
-        import sync_assets # 导入你写的脚本
-        import io
-        import sys
-        
+    def _run_sync():        
         # 拦截 print 输出，以便发给 Telegram
         captured_output = io.StringIO()
         sys.stdout = captured_output
@@ -320,6 +320,7 @@ async def show_others_menu(callback: CallbackQuery):
     await callback.answer()
 
 # ================= 3. 动态展示单地域所有账号状态 =================
+# ================= 3. 动态展示单地域所有账号状态 =================
 @router.callback_query(F.data.startswith("sys_region_"))
 async def manage_specific_region(callback: CallbackQuery):
     
@@ -329,10 +330,22 @@ async def manage_specific_region(callback: CallbackQuery):
     
     # 🌟 核心升级：连表查询，把所有激活账号和该地域的模板拉出来对比
     def get_all_accounts_status(r_id):
-        import sqlite3
-        from config import DB_PATH
-        conn = sqlite3.connect(DB_PATH)
+
+        # 🛠️ 修复1：增加 timeout 防止被其他并发操作锁死
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
         cursor = conn.cursor()
+        
+        # 🛠️ 修复2：强制兜底建表，防止全新环境执行 LEFT JOIN 时报错崩溃
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS launch_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER,
+                region_id TEXT,
+                template_id TEXT,
+                UNIQUE(account_id, region_id)
+            )
+        """)
+        
         cursor.execute('''
             SELECT c.alias, l.template_id 
             FROM cloud_accounts c
@@ -343,7 +356,7 @@ async def manage_specific_region(callback: CallbackQuery):
         conn.close()
         return res
         
-    import asyncio
+
     results = await asyncio.to_thread(get_all_accounts_status, region_id)
     
     text = f"🌍 **地域**: `{region_name}` (`{region_id}`)\n\n"
@@ -360,8 +373,7 @@ async def manage_specific_region(callback: CallbackQuery):
                 
         text += "\n*(注: 采用 IaC 架构后不再支持手动修改，请通过一键开荒全自动校准网络环境。)*"
 
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    from aiogram.types import InlineKeyboardButton
+
     builder = InlineKeyboardBuilder()
     
     # 单地域一键开荒
@@ -401,16 +413,27 @@ async def trigger_single_region_init(call: types.CallbackQuery):
         from config import DB_PATH
         
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=20.0)
             cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS launch_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER,
+                    region_id TEXT,
+                    template_id TEXT,
+                    UNIQUE(account_id, region_id)
+                )
+            """)
+            
             cursor.execute("SELECT id, alias, access_key, access_secret FROM cloud_accounts WHERE is_active = 1")
             accounts = cursor.fetchall()
             
             new_configured = 0
+            failed_count = 0  # 🌟 新增：统计失败次数
+            
             for acc in accounts:
                 acc_id, acc_alias, acc_ak, acc_sk = acc
                 
-                # 防重检测：如果没有才建
                 cursor.execute(
                     "SELECT template_id FROM launch_templates WHERE account_id = ? AND region_id = ?", 
                     (acc_id, region_id)
@@ -418,26 +441,32 @@ async def trigger_single_region_init(call: types.CallbackQuery):
                 existing = cursor.fetchone()
                 
                 if not (existing and existing[0]):
-                    init_regions.init_region_for_account(acc_id, acc_alias, acc_ak, acc_sk, region_id)
-                    new_configured += 1
+                    # 🌟 核心修复：接收真实结果，如果脚本崩溃返回False，必须记作失败！
+                    is_success = init_regions.init_region_for_account(acc_id, acc_alias, acc_ak, acc_sk, region_id)
+                    if is_success:
+                        new_configured += 1
+                    else:
+                        failed_count += 1
             
             conn.close()
             
-            if new_configured == 0:
-                await call.message.answer(f"✅ `{region_id}` 扫描完毕，所有账号均已配置，无需操作。")
+            # 🌟 修复：不再谎报军情，严格判断真实结果
+            if failed_count > 0:
+                await call.message.answer(f"❌ **`{region_id}` 开荒遭遇失败！**\n\n有 {failed_count} 个账号未能成功配置。请立刻去服务器终端查看日志 (终端应该输出了红色 ❌ 错误原因)！")
+            elif new_configured == 0:
+                await call.message.answer(f"✅ `{region_id}` 扫描完毕，所有账号此前均已成功配置完毕。")
             else:
                 await call.message.answer(f"🎉 **单地域开荒完成**\n\n成功为 {new_configured} 个账号配置了 `{region_id}` 的基建和启动模板！")
                 
         except Exception as e:
-            await call.message.answer(f"❌ **单地域开荒发生异常**\n\n原因: `{str(e)}`")
+            await call.message.answer(f"❌ **后台执行严重异常**\n\n原因: `{str(e)}`")
 
-    import asyncio
     asyncio.create_task(bg_single_task())
 
 # ================= 4. 拦截“全局开荒”与“单地域开荒”的后台任务 =================
 @router.callback_query(F.data == "run_global_init")
 async def trigger_global_init(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return await call.answer()
+    # 删除了冗余且报错的权限校验，由文件顶部的 router filter 统一拦截
     await call.message.edit_text("⏳ **正在后台执行 [全局] 自动化开荒...**\n\n预计需要几分钟时间，请稍作等待。完成后机器人会主动向您发送通知。", parse_mode="Markdown")
     await call.answer()
     

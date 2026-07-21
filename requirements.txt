@@ -2,9 +2,13 @@
 aiogram>=3.4.0
 
 # ==================== 阿里云 SDK 全家桶 ====================
+alibabacloud-tea-openapi>=0.3.8
 alibabacloud_ecs20140526>=3.0.0
 alibabacloud_cms20190101>=2.0.0
-alibabacloud-tea-openapi>=0.3.8
+alibabacloud_vpc20160428
+
+# ==================== SSH 远程连接与自动化部署 ====================
+paramiko>=3.0.0
 
 # ==================== 定时任务与系统监控 ====================
 apscheduler>=3.10.0,<4.0.0

@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 import config  # 统一从 config 获取配置与路径
 import os
+from config import DB_PATH # 确保导入了你的数据库路径
 DB_PATH = config.DB_PATH  # ⭐ 就是加在这里！导出给 tasks.py 等外部模块调用
 
 logger = logging.getLogger("MG_Bot.DB")
@@ -17,7 +18,7 @@ def get_connection():
     return conn
 
 def init_db():
-    """初始化数据库，开启 WAL 并并发优化模式，创建 IDC 核心表"""
+    """初始化数据库，开启 WAL 并并发优化模式，支持多账号架构"""
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -25,10 +26,22 @@ def init_db():
         # ⭐ 核心性能优化：开启 SQLite WAL (预写式日志) 模式，大幅提高异步并发读写能力
         cursor.execute("PRAGMA journal_mode=WAL;")
         
-        # 1. 业务管理表 (补全 region_id, ip, name 等机器基础元数据，契合 node.py 架构)
+        # ==================== 1. 云账号凭证表 (新增) ====================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cloud_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alias TEXT NOT NULL,                  -- 账号别名，如 '主账号'、'客户A'
+                access_key TEXT NOT NULL,
+                access_secret TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1           -- 1为启用，0为停用
+            )
+        """)
+
+        # ==================== 2. 业务管理表 (升级) ====================
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ecs_business (
                 instance_id TEXT PRIMARY KEY,
+                account_id INTEGER DEFAULT 1,           -- 🔴 新增：归属的云账号 ID
                 name TEXT DEFAULT '无名节点',           -- 服务器备注名
                 region_id TEXT DEFAULT 'cn-hongkong',   -- 归属地域
                 ip TEXT DEFAULT '0.0.0.0',              -- 公网 IP
@@ -39,7 +52,19 @@ def init_db():
             )
         """)
         
-        # 2. 系统全局配置表
+        # ==================== 3. 启动模板表 (升级) ====================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS launch_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,          -- 🔴 新增：区分是哪个账号的模板
+                region_id TEXT NOT NULL,
+                region_name TEXT,
+                template_id TEXT,
+                UNIQUE(account_id, region_id)         -- 确保每个账号在每个地域只有一个模板记录
+            )
+        """)
+
+        # ==================== 4. 系统全局配置表 (保持不变) ====================
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sys_config (
                 key TEXT PRIMARY KEY,
@@ -47,16 +72,7 @@ def init_db():
             )
         """)
         
-        # 3. 启动模板表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS launch_templates (
-                region_id TEXT PRIMARY KEY,
-                region_name TEXT,
-                template_id TEXT
-            )
-        """)
-
-        # 4. 自定义 SSH 服务器表
+        # ==================== 5. 自定义 SSH 服务器表 (保持不变) ====================
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS custom_servers (
                 instance_id TEXT PRIMARY KEY,
@@ -67,8 +83,15 @@ def init_db():
         
         # 写入默认全局重装密码
         cursor.execute("INSERT OR IGNORE INTO sys_config (key, value) VALUES ('default_password', '@QS00008')")
+        
+        # 自动写入一个默认的主账号占位符 (防止老代码报错)
+        cursor.execute("""
+            INSERT OR IGNORE INTO cloud_accounts (id, alias, access_key, access_secret) 
+            VALUES (1, '默认主账号', '请修改AK', '请修改SK')
+        """)
+        
         conn.commit()
-        logger.info("✅ 数据库表结构与 WAL 高并发优化模式已成功加载！")
+        logger.info("✅ 数据库表结构与 WAL 高并发优化模式已成功加载 (多账号版)！")
     except Exception as e:
         logger.error(f"❌ 数据库初始化失败: {e}")
         raise e
@@ -172,17 +195,38 @@ def update_business_data(instance_id: str, field: str, value):
     finally:
         conn.close()
 
-def add_template(region_id: str, region_name: str, template_id: str):
-    """向数据库添加或更新指定地域的启动模板"""
+def add_template(account_id: int, region_id: str, region_name: str, template_id: str):
+    """向数据库添加或更新指定账号、指定地域的启动模板"""
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("REPLACE INTO launch_templates (region_id, region_name, template_id) VALUES (?, ?, ?)", 
-                       (region_id, region_name, template_id))
+        # 🌟 核心修改：加入了 account_id，并将它与 region_id 作为复合条件
+        cursor.execute(
+            "REPLACE INTO launch_templates (account_id, region_id, region_name, template_id) VALUES (?, ?, ?, ?)", 
+            (account_id, region_id, region_name, template_id)
+        )
         conn.commit()
     except Exception as e:
-        logger.error(f"添加模板失败 region_id={region_id}: {e}")
+        logger.error(f"添加模板失败 账号={account_id} region_id={region_id}: {e}")
         raise e
+    finally:
+        conn.close()
+
+def get_template_id(account_id: int, region_id: str):
+    """查询指定账号下某地域的启动模板 ID"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        # 🌟 核心读取：精准匹配当前账号和地域
+        cursor.execute(
+            "SELECT template_id FROM launch_templates WHERE account_id = ? AND region_id = ?", 
+            (account_id, region_id)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        logger.error(f"查询模板失败: {e}")
+        return None
     finally:
         conn.close()
 
@@ -277,3 +321,4 @@ def delete_custom_server(instance_id: str):
         conn.commit()
     finally:
         conn.close()
+

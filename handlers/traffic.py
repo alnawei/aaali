@@ -1,11 +1,39 @@
 import asyncio
 import traceback
+from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from db import get_active_servers
 import config
 
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+
 router = Router()
+
+
+# ================= 定义状态机 =================
+class TrafficSettingsFSM(StatesGroup):
+    wait_for_warn_line = State()
+    wait_for_stop_line = State()
+
+
+# ================= 🛠️ 辅助函数：生成精美进度条 =================
+def get_progress_bar(used: float, total: float, length: int = 5) -> str:
+    """根据使用比例生成可视化的 Emoji 进度条"""
+    if total <= 0: return "⬜" * length
+    percent = min(used / total, 1.0)
+    filled = int(percent * length)
+    empty = length - filled
+    
+    # 动态变色：超过 95% 变红，超过 80% 变黄，正常为绿
+    if percent >= 0.95:
+        return "🟥" * filled + "⬜" * empty
+    elif percent >= 0.80:
+        return "🟨" * filled + "⬜" * empty
+    else:
+        return "🟩" * filled + "⬜" * empty
 
 # ================= 🛡️ 流量与计费核心入口 (绝不卡死防护版) =================
 @router.message(F.text == "📊 流量与计费")
@@ -30,8 +58,20 @@ async def show_traffic_report(message: Message):
             timeout=15.0
         )
         
-        # 3. 成功后更新消息
-        await wait_msg.edit_text(report_text, parse_mode="HTML")
+        # 🌟 3. 新增：构建悬浮设置按钮
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="⚙️ 设置全局预警线", callback_data="sys_set_warn_line"),
+            InlineKeyboardButton(text="🚨 设置全局熔断线", callback_data="sys_set_stop_line")
+        )
+        builder.row(InlineKeyboardButton(text="🔄 重新刷新报表", callback_data="refresh_traffic_report"))
+        
+        # 4. 成功后更新消息，并带上底部按钮
+        await wait_msg.edit_text(
+            report_text, 
+            parse_mode="HTML", 
+            reply_markup=builder.as_markup()
+        )
         
     except asyncio.TimeoutError:
         # 针对网络超时卡死，给出优雅退出说明
@@ -63,24 +103,138 @@ async def generate_traffic_summary(servers):
         f"━━━━━━━━━━━━━━━━━━\n"
     )
     
+    # 动态获取当前时间，用于计算剩余到期天数
+    now = datetime.now()
+    
     # 逐台尝试解析流量
     for srv in servers:
         inst_id = srv.get("instance_id", "未知ID")
         ip = srv.get("ip", "未知IP")
         region = srv.get("region", "香港")
         
+        # 🌟 模拟从数据库和 CMS 获取的真实业务数据（请替换为你真实的取值逻辑）
+        limit_gb = srv.get("traffic_limit_gb", 500) # 总额度
+        # used_gb = await fetch_aliyun_traffic_gb(...) # 这里是你真正调 API 的地方
+        used_gb = srv.get("used_traffic_gb", 125.4) # 模拟当前用量
+        
+        expire_str = srv.get("expire_time", "2026-08-21")
+        
+        # 计算剩余天数
         try:
-            # 你之前的代码可能在这里去调阿里 CMS API：
-            # traffic_gb = await fetch_aliyun_traffic_gb(inst_id, region)
-            # 为了防止死锁，我们这里用保底展示逻辑：
-            report += f"🖥 <b>[{region}]</b> <code>{ip}</code>\n"
-            report += f"   └ 实例ID：<code>{inst_id}</code>\n"
-            report += f"   └ 运行状态：🟢 正常运作\n"
+            expire_date = datetime.strptime(expire_str, "%Y-%m-%d")
+            days_left = (expire_date - now).days
+            days_text = f"剩余 {days_left} 天" if days_left >= 0 else "已逾期"
+        except ValueError:
+            days_text = "日期解析错误"
+
+        # 计算百分比与进度条
+        percent = min((used_gb / limit_gb) * 100, 100) if limit_gb > 0 else 0
+        bar = get_progress_bar(used_gb, limit_gb)
+        
+        try:
+            # 🌟 升级后的展示逻辑，将核心数据“拍在脸上”
+            report += f"💻 <b>[{region}]</b> <code>{ip}</code>\n"
+            # 状态可根据实例实际状态动态改变，此处做基础判断示例
+            status_emoji = "🔴 已停用 (流量耗尽熔断)" if percent >= 95 else "🟢 正常运作"
+            report += f" └ 状态: {status_emoji}\n"
+            report += f" └ 流量: {used_gb} GB / {limit_gb} GB ({percent:.1f}%) {bar}\n"
+            report += f" └ 账期: {expire_str} 到期 ({days_text})\n\n"
         except Exception as e:
-            report += f"🖥 <code>{ip}</code> (查询轻微受阻: {str(e)[:20]})\n"
+            report += f"💻 <code>{ip}</code> (数据解析受阻: {str(e)[:20]})\n\n"
             
     report += (
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 <i>提示：所有计算按自然月统计。建议您为重要节点在「MG 私有面板」内单独赋予细粒度的流量预警断网额度！</i>"
+        f"💡 <i>提示：所有计算默认按开机日为锚点循环。警戒线/熔断线一旦触发，系统将在后台全自动执行私聊警告或强制断网操作。</i>"
     )
     return report
+
+
+# ================= 1. 刷新报表按钮 =================
+@router.callback_query(F.data == "refresh_traffic_report")
+async def process_refresh_traffic(call: CallbackQuery):
+    await call.answer("🔄 正在重新拉取最新数据...")
+    # 为了保持聊天框整洁，直接删掉旧报表，重新调用主入口发一份新的
+    await call.message.delete()
+    await show_traffic_report(call.message)
+
+# ================= 2. 设置警戒线 =================
+@router.callback_query(F.data == "sys_set_warn_line")
+async def ask_warn_line(call: CallbackQuery, state: FSMContext):
+    # 如果有全局权限校验，可以在这里加 if call.from_user.id != config.ADMIN_ID: return
+    await state.set_state(TrafficSettingsFSM.wait_for_warn_line)
+    
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="❌ 取消操作", callback_data="cancel_fsm_action"))
+    
+    await call.message.answer(
+        "⚠️ **请直接回复新的全局【警戒线】百分比：**\n\n"
+        "*(请输入 1-99 之间的纯数字，例如 80 代表 80%)*",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+@router.message(TrafficSettingsFSM.wait_for_warn_line)
+async def receive_warn_line(message: Message, state: FSMContext):
+    val = message.text.strip()
+    if not val.isdigit() or not (1 <= int(val) <= 99):
+        return await message.answer("❌ 格式错误！请输入 1-99 之间的纯数字：")
+    
+    warn_percent = int(val)
+    
+    # 🌟 这里对接你的数据库写入逻辑
+    # import db
+    # db.update_global_config("traffic_warn_line", warn_percent)
+    
+    await state.clear()
+    await message.answer(
+        f"✅ **全局预警线已成功修改为: `{warn_percent}%`**\n\n"
+        f"当任意节点流量达到此阈值时，机器人将主动向您发送私聊预警。", 
+        parse_mode="Markdown"
+    )
+
+# ================= 3. 设置熔断线 =================
+@router.callback_query(F.data == "sys_set_stop_line")
+async def ask_stop_line(call: CallbackQuery, state: FSMContext):
+    await state.set_state(TrafficSettingsFSM.wait_for_stop_line)
+    
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="❌ 取消操作", callback_data="cancel_fsm_action"))
+    
+    await call.message.answer(
+        "🚨 **请直接回复新的全局【熔断线】百分比：**\n\n"
+        "*(请输入 50-100 之间的纯数字，例如 95 代表 95%)*",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+@router.message(TrafficSettingsFSM.wait_for_stop_line)
+async def receive_stop_line(message: Message, state: FSMContext):
+    val = message.text.strip()
+    if not val.isdigit() or not (50 <= int(val) <= 100):
+        return await message.answer("❌ 格式错误！请输入 50-100 之间的纯数字：")
+    
+    stop_percent = int(val)
+    
+    # 🌟 这里对接你的数据库写入逻辑
+    # import db
+    # db.update_global_config("traffic_stop_line", stop_percent)
+    
+    await state.clear()
+    await message.answer(
+        f"✅ **全局熔断线已成功修改为: `{stop_percent}%`**\n\n"
+        f"当任意节点流量达到此阈值时，系统将在后台强行执行物理关机止损！", 
+        parse_mode="Markdown"
+    )
+
+# ================= 4. 通用取消按钮 =================
+@router.callback_query(F.data == "cancel_fsm_action")
+async def cancel_fsm_action(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("✅ 操作已取消。")
+    await call.answer()

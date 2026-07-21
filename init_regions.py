@@ -190,7 +190,7 @@ def init_region_for_account(account_id, alias, ak, sk, region_id):
                 instance_charge_type="PrePaid",      # 实例计费方式：PrePaid (包年包月)
                 period=1,                            # 购买时长：1
                 period_unit="Month",                 # 时长单位：Month (月)
-                auto_renew=False,,                   # 自动续费：True (强烈建议开启，防止机器忘记续费被释放)
+                auto_renew=False,                    # 自动续费：True (强烈建议开启，防止机器忘记续费被释放)
 
                 user_data=user_data_b64,
                 system_disk=system_disk_config,

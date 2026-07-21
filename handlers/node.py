@@ -183,6 +183,19 @@ def build_servers_keyboard(user_id: int):
 # ================= 🚀 第一步：接收主菜单点击 =================
 @router.message(F.text == "⚙️ 节点配置")
 async def show_node_list(message: types.Message):
+    servers = get_servers_data(message.from_user.id)
+    
+    # 🌟 空列表防呆拦截：如果没有任何机器，直接拦截并提示
+    if not servers:
+        return await message.answer(
+            "📭 **当前名下暂无可用机器！**\n\n"
+            "请先前往【💻 服务器管理】开通新服务器，或点击下方按钮添加自定义节点。",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ 添加自定义服务器 (SSH)", callback_data="custom_srv:add")]
+            ]),
+            parse_mode="Markdown"
+        )
+
     keyboard = build_servers_keyboard(message.from_user.id)
     await message.answer(
         "⚙️ **节点配置中心 (第一步)**\n\n请在下方悬浮菜单中选择你要操作的服务器：",
@@ -277,10 +290,26 @@ async def show_script_options(call: types.CallbackQuery):
     servers = get_servers_data(call.from_user.id)
     srv = next((s for s in servers if s["instance_id"] == instance_id), None)
     
+    # 🌟 修复开机直通车：如果缓存里没查到，直接去底层账本精准捞取，坚决不使用硬编码兜底！
     if not srv:
-        srv = {"instance_id": instance_id, "ip": "8.217.219.166", "region": "cn-hongkong"}
+        try:
+            import sqlite3
+            conn = sqlite3.connect('/srv/aali/bot_data.db', timeout=3.0)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT instance_id, ip, region_id FROM ecs_business WHERE instance_id=?", (instance_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                srv = dict(row)
+        except Exception:
+            pass
+
+    # 如果底层彻底查不到，弹窗报错并拦截
+    if not srv:
+        return await call.answer("❌ 无法在本地账本中定位该服务器，数据可能未同步！", show_alert=True)
         
-    region_id = srv.get("region", "cn-hongkong")
+    region_id = srv.get("region_id", srv.get("region", "cn-hongkong"))
     region_name = REGION_MAP.get(region_id, region_id)
     public_ip = srv.get("ip", "0.0.0.0")
     
@@ -298,9 +327,7 @@ async def show_script_options(call: types.CallbackQuery):
     
     builder = []
     for script in raw_scripts:
-        # 直接从刚才一次性获取的字典中读状态，0延迟
         is_running = status_dict.get(script["id"], False)
-        
         status_icon = "🟢" if is_running else "🔴"
         button_text = f"{status_icon} {script['label']}"
         cb_data = f"run_sh:{script['id']}:{instance_id}"
@@ -327,6 +354,18 @@ async def show_script_options(call: types.CallbackQuery):
 # ================= ↩️ 附加步：返回按钮逻辑 =================
 @router.callback_query(F.data == "back_to_srv_list")
 async def back_to_servers(call: types.CallbackQuery):
+    servers = get_servers_data(call.from_user.id)
+    
+    if not servers:
+        return await call.message.edit_text(
+            "📭 **当前名下暂无可用机器！**\n\n"
+            "请先前往【💻 服务器管理】开通新服务器，或点击下方按钮添加自定义节点。",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ 添加自定义服务器 (SSH)", callback_data="custom_srv:add")]
+            ]),
+            parse_mode="Markdown"
+        )
+
     keyboard = build_servers_keyboard(call.from_user.id)
     await call.message.edit_text(
         "⚙️ **节点配置中心 (第一步)**\n\n请在下方悬浮菜单中选择你要操作的服务器：",

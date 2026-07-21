@@ -8,6 +8,11 @@ import resend
 import config
 import glob
 import db  # 导入本地账本
+
+
+from aiogram.types import Message, CallbackQuery
+from handlers.common import get_dynamic_ecs_client
+
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from alibabacloud_cms20190101.client import Client as CmsClient
 from alibabacloud_cms20190101 import models as cms_models
@@ -30,13 +35,65 @@ router = Router()
 class ServerManagement(StatesGroup):
     waiting_for_code = State()
     waiting_for_region = State()
+    
+# ================= 新增：云账号添加状态 =================
+class CloudAccountStates(StatesGroup):
+    waiting_for_credentials = State()
+
+def get_account_selection_keyboard():
+    """动态生成云账号选择键盘"""
+    builder = InlineKeyboardBuilder()
+    
+    # 实时查库获取活跃账号
+    conn = sqlite3.connect(config.DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, alias FROM cloud_accounts WHERE is_active = 1")
+    accounts = cursor.fetchall()
+    conn.close()
+
+    if not accounts:
+        builder.row(InlineKeyboardButton(text="⚠️ 暂无可用云账号，请先添加", callback_data="no_action"))
+    else:
+        # 遍历账号生成按钮
+        for acc_id, alias in accounts:
+            builder.row(InlineKeyboardButton(text=f"🏢 {alias}", callback_data=f"select_acc:{acc_id}"))
+    
+    # 修正逻辑：这里应该放“添加云账号”，而不是 SSH
+    builder.row(InlineKeyboardButton(text="➕ 添加云账号", callback_data="add_cloud_account"))
+    builder.row(InlineKeyboardButton(text="关闭菜单", callback_data="close_menu"))
+    
+    return builder.as_markup()
 
 # ================= 1. 底层 API 与发信函数 =================
-def get_template_id(region_id: str) -> str:
+async def send_email_async(code: str) -> bool:
     """
-    ⚡️ 100% 精准锁定：从 bot_data.db 的 launch_templates 表实时抓取启动模板
+    ⚡️ 异步封装的 Resend API 发信 (彻底解决机器人卡死问题)
+    """
+    resend.api_key = config.RESEND_API_KEY 
+    
+    def _send():
+        params = {
+            "from": "onboarding@resend.dev",
+            "to": [config.RECIPIENT],
+            "subject": "MG 控制台 V2.0 - 极速 API 验证码",
+            "text": f"【MG 控制台】\n\n您的开服验证码是：{code}\n请在 5 分钟内返回 TG 进行验证。",
+        }
+        return resend.Emails.send(params)
+        
+    try:
+        email = await asyncio.to_thread(_send)
+        print(f"✅ API 发信成功: {email}")
+        return True
+    except Exception as e:
+        print(f"❌ Resend API 发信失败: {e}")
+        return False
+
+def get_template_id(account_id: int, region_id: str) -> str:
+    """
+    ⚡️ 已升级多账号架构：从 bot_data.db 的 launch_templates 表精准匹配指定账号和地域的模板
     彻底斩断对 .env 假占位符的任何依赖！
     """
+    
     # 1. 把真正的目标数据库 bot_data.db 放在第一优先级
     candidate_dbs = ['/srv/aali/bot_data.db']
     if hasattr(config, 'DB_PATH') and config.DB_PATH not in candidate_dbs:
@@ -50,50 +107,30 @@ def get_template_id(region_id: str) -> str:
         try:
             conn = sqlite3.connect(db_file, timeout=3.0)
             cursor = conn.cursor()
-            # 针对你刚才抓出来的数据结构：('cn-hongkong', '中国香港', 'lt-j6c...')
-            cursor.execute("SELECT * FROM launch_templates")
-            for row in cursor.fetchall():
-                # 只要当前这一组数据中包含我们要开机的地域 (比如 cn-hongkong)
-                if any(region_id.lower() == str(col).lower() for col in row):
-                    for col in row:
-                        if isinstance(col, str) and col.strip().startswith("lt-") and "xxxx" not in col:
-                            conn.close()
-                            return col.strip() # ⭐ 极速成功返回：lt-j6c2z7laetgycqgdtrcz
+            
+            # 🌟 核心升级：利用刚才数据库补充的 account_id，实现精准定向双重匹配！
+            cursor.execute(
+                "SELECT template_id FROM launch_templates WHERE account_id = ? AND (region_id = ? OR region_name = ?)", 
+                (account_id, region_id, region_id)
+            )
+            result = cursor.fetchone()
             conn.close()
+            
+            # 只要查到了，并且是合法的 lt- 开头，直接返回
+            if result and result[0] and str(result[0]).strip().startswith("lt-") and "xxxx" not in str(result[0]):
+                return str(result[0]).strip() 
+                
         except Exception:
             continue
 
-    # 3. 如果未配置，直接抛错阻断，绝对不再给阿里云发送假占位符 ID！
-    raise ValueError(f"提示：未在系统数据库中找到 [{region_id}] 的启动模板 ID！请在面板的「启动模板管理」中重新添加。")
+    # 3. 如果未配置，直接抛错阻断
+    raise ValueError(f"提示：未在系统数据库中找到 [账号ID:{account_id}] 在 [{region_id}] 的启动模板 ID！请在面板的「启动模板管理」中重新配置。")
 
-# 初始化 Resend
-resend.api_key = config.RESEND_API_KEY  # 记得去 config.py 里把这个变量读出来
-
-def send_email_sync(code: str) -> bool:
-    """彻底抛弃 SMTP，使用新一代 Resend API 发信"""
-    try:
-        params = {
-            "from": "onboarding@resend.dev",
-            "to": [config.RECIPIENT],
-            "subject": "MG 控制台 V2.0 - 极速 API 验证码",
-            "text": f"【MG 控制台】\n\n您的开服验证码是：{code}\n请在 5 分钟内返回 TG 进行验证。",
-        }
-        email = resend.Emails.send(params)
-        print(f"✅ API 发信成功: {email}")
-        return True
-    except Exception as e:
-        print(f"❌ Resend API 发信失败: {e}")
-        return False
-
-def create_ecs_instance_sync(region_id: str, template_id: str) -> dict:
+def create_ecs_instance_sync(account_id: int, region_id: str, template_id: str) -> dict:
     """同步调用阿里云 API 创建实例并轮询获取 IP (后台线程执行)"""
     try:
-        ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint=f'ecs.{region_id}.aliyuncs.com'
-        )
-        client = EcsClient(ali_config)
+        # 🌟 核心替换：删掉原来的静态 AK/SK，直接调用动态客户端工厂
+        client = get_dynamic_ecs_client(account_id, region_id)
 
         run_request = ecs_models.RunInstancesRequest(
             region_id=region_id,
@@ -131,16 +168,12 @@ def create_ecs_instance_sync(region_id: str, template_id: str) -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def get_real_instances_sync() -> list:
-    """调用阿里云 API，获取所有真实的 ECS 服务器列表"""
-    region_id = "cn-hongkong"
+def get_instances_by_account(account_id: int, region_id: str = "cn-hongkong") -> list:
+    """调用阿里云 API，动态获取指定账号下的 ECS 服务器列表"""
     try:
-        ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint=f'ecs.{region_id}.aliyuncs.com'
-        )
-        client = EcsClient(ali_config)
+        # ⭐ 核心改变：直接调用动态工厂，传入账号 ID，实时生成专属 Client
+        client = get_dynamic_ecs_client(account_id, region_id)
+        
         req = ecs_models.DescribeInstancesRequest(region_id=region_id, page_size=50)
         resp = client.describe_instances(req)
         
@@ -157,19 +190,29 @@ def get_real_instances_sync() -> list:
                 })
         return instances
     except Exception as e:
-        print(f"获取实例列表失败: {e}")
+        print(f"❌ 获取实例列表失败 (Account ID: {account_id}, Region: {region_id}): {e}")
         return []
 
 # ================= 2. 动态折叠菜单 UI 构建器 =================
 
 def get_region_main_menu():
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
     builder = InlineKeyboardBuilder()
+    
+    # 🌟 修复关键：暗号必须是 region_cn-hongkong
     builder.row(InlineKeyboardButton(text="🇭🇰 中国香港", callback_data="region_cn-hongkong"))
+    
+    # 下面这些是控制展开二级菜单的，对应你的 F.data.startswith("menu_")，不用动
     builder.row(
         InlineKeyboardButton(text="🌏 亚洲地区", callback_data="menu_asia"),
         InlineKeyboardButton(text="🌍 欧美地区", callback_data="menu_eu_us")
     )
     builder.row(InlineKeyboardButton(text="🐪 中东及其他", callback_data="menu_others"))
+    
+    # 返回主菜单
+    builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="sys_main")) 
+    
     return builder.as_markup()
 
 def get_region_asia_menu():
@@ -219,42 +262,188 @@ def get_region_others_menu():
     builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="menu_main"))
     return builder.as_markup()
 
-# ================= 3. 核心业务路由拦截 =================
+
 
 @router.message(F.text == "💻 服务器管理")
 async def cmd_server_management(message: types.Message, state: FSMContext):
-    wait_msg = await message.answer("🔄 正在向阿里云获取最新服务器状态，请稍候...")
-    instances = await asyncio.to_thread(get_real_instances_sync)
+    # 清理可能存在的旧状态，确保回到最初的起点
+    await state.clear()
     
-    running_count = sum(1 for i in instances if i['status'] == 'Running')
-    stopped_count = sum(1 for i in instances if i['status'] in ['Stopped', 'Stopping'])
-    pending_count = sum(1 for i in instances if i['status'] in ['Pending', 'Starting'])
-
     text = (
-        "📊 **当前 ECS 服务器概览**\n\n"
-        f"🟢 运行中: {running_count} 台\n"
-        f"🔴 已停用: {stopped_count} 台\n"
-        f"🔵 部署/开机中: {pending_count} 台\n"
+        "📊 **服务器配置中心**\n\n"
+        "请先选择你要操作的资源池 / 云账号："
     )
     
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="➕ 新增服务器", callback_data="add_server"))
-    
-    for inst in instances:
-        if inst['status'] == 'Running':
-            status_emoji = "🟢"
-        elif inst['status'] in ['Stopped', 'Stopping']:
-            status_emoji = "🔴"
-        else:
-            status_emoji = "🔵"
-            
-        btn_text = f"{status_emoji} IP: {inst['ip']}"
-        btn_data = f"manage_ecs_{inst['id']}" 
-        builder.row(InlineKeyboardButton(text=btn_text, callback_data=btn_data))
-    
-    await wait_msg.delete()
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    # 调用我们刚刚写好的动态多账号键盘
+    await message.answer(
+        text, 
+        reply_markup=get_account_selection_keyboard(), 
+        parse_mode="Markdown"
+    )
 
+
+@router.callback_query(F.data.startswith("select_acc:"))
+async def process_account_selection(call: types.CallbackQuery, state: FSMContext):
+
+    # 1. 拆解回调数据，提取出账号 ID
+    account_id_str = call.data.split(":")[1]
+    
+    # 将字符串类型的 ID 转换为整数
+    account_id = int(account_id_str)
+    
+    # 2. 将当前选中的 account_id 存入状态机 (FSM)
+    await state.update_data(current_account_id=account_id)
+    
+    try:
+        # =====================================================================
+        # ⚠️ 注意：这里调用的是改造后的、支持多账号的查询函数
+        # =====================================================================
+        instances = await asyncio.to_thread(get_instances_by_account, account_id)
+        
+        running_count = sum(1 for i in instances if i['status'] == 'Running')
+        stopped_count = sum(1 for i in instances if i['status'] in ['Stopped', 'Stopping'])
+        pending_count = sum(1 for i in instances if i['status'] in ['Pending', 'Starting'])
+
+        text = (
+            f"🏢 **当前账号 ECS 概览**\n\n"
+            f"🟢 运行中: {running_count} 台\n"
+            f"🔴 已停用: {stopped_count} 台\n"
+            f"🔵 部署/开机中: {pending_count} 台\n"
+        )
+        
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="➕ 新增服务器", callback_data="add_server"))
+        
+        for inst in instances:
+            if inst['status'] == 'Running':
+                status_emoji = "🟢"
+            elif inst['status'] in ['Stopped', 'Stopping']:
+                status_emoji = "🔴"
+            else:
+                status_emoji = "🔵"
+                
+            btn_text = f"{status_emoji} IP: {inst['ip']}"
+            btn_data = f"srv_sel:{inst['id']}"
+            builder.row(InlineKeyboardButton(text=btn_text, callback_data=btn_data))
+            
+        builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="back_to_accounts"))
+        
+        await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        
+    except Exception as e:
+        await call.message.edit_text(f"❌ 获取服务器列表失败：{str(e)}\n请检查该账号的 API 密钥配置。")
+
+# ================= 菜单导航联动拦截器 =================
+
+# 1. 🔙 返回上级 (从二级机器列表回到一级账号列表)
+@router.callback_query(F.data == "back_to_accounts")
+async def process_back_to_accounts(call: types.CallbackQuery, state: FSMContext):
+    # 清理掉之前选中的 account_id 状态
+    await state.clear()
+    
+    text = (
+        "📊 **服务器配置中心**\n\n"
+        "请先选择你要操作的资源池 / 云账号："
+    )
+    # 重新渲染一级菜单
+    await call.message.edit_text(
+        text, 
+        reply_markup=get_account_selection_keyboard(), 
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+# 2. ❌ 关闭菜单
+@router.callback_query(F.data == "close_menu")
+async def process_close_menu(call: types.CallbackQuery):
+    # 直接删除这条菜单消息，保持对话框整洁
+    await call.message.delete()
+    await call.answer()
+
+# 3. ➕ 添加云账号入口
+@router.callback_query(F.data == "add_cloud_account")
+async def process_add_cloud_account(call: types.CallbackQuery, state: FSMContext):
+    # 激活状态，告诉机器人下一步该接收文本消息了
+    await state.set_state(CloudAccountStates.waiting_for_credentials)
+    
+    text = (
+        "📝 **新增云账号**\n\n"
+        "请直接回复新账号的信息，使用半角逗号分隔，格式如下：\n"
+        "`别名,AccessKey,AccessSecret`\n\n"
+        "📖 **如何获取阿里云 API 密钥？**\n"
+        "1. 登录阿里云控制台，鼠标悬停在右上角头像。\n"
+        "2. 进入 **AccessKey 管理** (推荐使用 RAM 子账号以确保安全)。\n"
+        "3. 点击 **创建 AccessKey**，复制生成的 AK 和 SK。\n\n"
+        "💡 **回复示例：**\n"
+        "`香港主力机房,LTAI5t...,your_secret_key...`\n\n"
+        "*(随时回复 /cancel 取消操作)*"
+    )
+    await call.message.edit_text(text, parse_mode="Markdown")
+    await call.answer()
+
+# 4. 📝 接收用户输入的账号信息并写入数据库
+@router.message(CloudAccountStates.waiting_for_credentials)
+async def process_credentials_input(message: types.Message, state: FSMContext):
+    # 如果用户输入了 /cancel，则直接退出状态
+    if message.text.strip().lower() == "/cancel":
+        await state.clear()
+        await message.answer("已取消添加云账号操作。")
+        return
+
+    text = message.text.strip()
+    # 兼容中文逗号和英文逗号，统一替换为英文逗号
+    text = text.replace("，", ",")
+    parts = text.split(",")
+    
+    if len(parts) != 3:
+        await message.answer("⚠️ 格式错误！请确保包含别名、AccessKey 和 AccessSecret，并用逗号隔开。\n\n请重新发送，或回复 /cancel 取消。")
+        return
+        
+    alias, ak, sk = [p.strip() for p in parts]
+    
+    if not ak or not sk:
+        await message.answer("⚠️ AccessKey 或 Secret 不能为空，请重新发送。")
+        return
+        
+    wait_msg = await message.answer("🔄 正在加密保存并刷新账号列表...")
+    
+    try:
+        # 直接连接数据库写入新账号 (is_active 默认为 1 启用)
+        conn = sqlite3.connect(config.DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO cloud_accounts (alias, access_key, access_secret, is_active) VALUES (?, ?, ?, 1)",
+            (alias, ak, sk)
+        )
+        conn.commit()
+        conn.close()
+        
+        # 任务完成，清除 FSM 状态
+        await state.clear()
+        await wait_msg.delete()
+        
+        # 组装成功提示并重新调出账号选择键盘（新账号会瞬间出现在键盘上）
+        success_text = (
+            f"✅ **云账号添加成功！**\n\n"
+            f"🏢 资源池别名: {alias}\n"
+            f"🔑 识别码: {ak[:4]}****{ak[-4:] if len(ak)>8 else ''}\n\n"
+            f"请在下方选择你要操作的账号："
+        )
+        
+        # 重新渲染主界面
+        await message.answer(
+            success_text,
+            reply_markup=get_account_selection_keyboard(),
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        await wait_msg.delete()
+        await message.answer(f"❌ 数据库写入失败: {str(e)}\n请重试，或回复 /cancel 取消。")
+
+    # 提示：下一步我们需要在这里激活一个 FSM 状态，等待用户打字回复
+
+    
 # =====================================================================
 # ================= 🚀 新增服务器 (邮箱验证 + 调用启动模板) =================
 # =====================================================================
@@ -262,19 +451,30 @@ async def cmd_server_management(message: types.Message, state: FSMContext):
 @router.callback_query(F.data == "add_server")
 async def trigger_add_server(callback: types.CallbackQuery, state: FSMContext):
     """处理【新增服务器】点击事件"""
+    # 1. 保留你的最高权限拦截
     if callback.from_user.id != config.ADMIN_ID: 
         return await callback.answer("权限不足！", show_alert=True)
 
+    # 2. 🌟 核心新增：确保当前 FSM 记忆里有刚选中的账号 ID
+    user_data = await state.get_data()
+    account_id = user_data.get("current_account_id")
+    if not account_id:
+        return await callback.answer("⚠️ 会话已过期，请退回主菜单重新选择账号", show_alert=True)
+
+    # 3. 完美继承你的发信逻辑
     verify_code = f"{random.randint(0, 999999):06d}"
     await callback.message.answer("⏳ 正在向绑定邮箱发送验证码，请稍候...")
-    send_success = await asyncio.to_thread(send_email_sync, verify_code)
+    send_success = await send_email_async(verify_code)
 
     if send_success:
+        # 💡 这里非常关键：update_data 是追加数据，它会把 code 塞进去，
+        # 同时完美保留我们上一环存进去的 current_account_id！
         await state.update_data(code=verify_code, timestamp=time.time())
         await state.set_state(ServerManagement.waiting_for_code)
         await callback.message.answer("✅ 验证码已发送至绑定邮箱！\n请直接在此回复 `6位数字验证码`。")
     else:
         await callback.message.answer("❌ 验证码发送失败，请检查 SMTP 或网络配置。")
+        
     await callback.answer()
 
 @router.message(ServerManagement.waiting_for_code)
@@ -290,17 +490,18 @@ async def verify_add_server_code(message: types.Message, state: FSMContext):
         return await message.answer("⚠️ 验证码已过期，请重新进入【💻 服务器管理】点击新增。")
 
     if user_input_code == user_data.get("code"):
-        # 验证成功！清除状态机
-        await state.clear()
+        # ⚠️ 删除了 await state.clear()，以保护 current_account_id 往下传递
         
         # 接入数据库模板逻辑
         import db
         templates = db.get_all_templates()
         
-        # 🛠️ 修正 2：修复了原代码中 return await message 的致命错误，完善状态转入选择地域菜单
         if not templates:
+            # 如果没有模板，说明业务跑不下去，这时候再 clear 并拦截
+            await state.clear()
             return await message.answer("⚠️ 当前没有任何配置好的云端启动模板，请先在控制台或数据库中添加后再试。")
             
+        # 状态机完美转移：账号 ID 被安全保留，同时进入等待选地域阶段
         await state.set_state(ServerManagement.waiting_for_region)
         await message.answer(
             "✅ 验证码核对无误！\n请选择您要部署新ECS服务器的目标地域：", 
@@ -332,16 +533,26 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
     """接收最终的地区选择，调用阿里云 API 自动化开机"""
     if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     
+    # 🌟 1. 核心新增：提取我们在第一步存下的 account_id
+    user_data = await state.get_data()
+    account_id = user_data.get("current_account_id")
+    
+    if not account_id:
+        await state.clear()
+        return await callback.message.edit_text("⚠️ 账号上下文已丢失，请返回主菜单重新选择云账号。")
+    
     region_id = callback.data.replace("region_", "")
-    template_id = get_template_id(region_id)
+    template_id = get_template_id(account_id, region_id)
     
     if not template_id:
         return await callback.message.edit_text(f"⚠️ 暂未在系统或 `.env` 中配置 `{region_id}` 对应的启动模板，请配置后重试。")
         
+    # 拿到账号并验证通过后，安全清理状态机
     await state.clear()
-    progress_msg = await callback.message.edit_text(f"🚀 已拦截指令。正在向阿里云 `{region_id}` 下发创建任务，请耐心等待 (约需20-40秒)...")
+    progress_msg = await callback.message.edit_text(f"🚀 已拦截指令。正在向目标云账号的 `{region_id}` 下发创建任务，请耐心等待 (约需20-40秒)...")
     
-    result = await asyncio.to_thread(create_ecs_instance_sync, region_id, template_id)
+    # 🌟 2. 核心改变：把 account_id 作为第一个参数，传给底层的开机函数
+    result = await asyncio.to_thread(create_ecs_instance_sync, account_id, region_id, template_id)
     
     if result["success"]:
         inst_id = result['instance_id']
@@ -354,9 +565,7 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
                 conn = sqlite3.connect(db_file, timeout=2.0)
                 for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
                     try:
-                        # 1. 如果表里已经有这台机器，强行把 0.0.0.0 覆写为真正的 IP
                         cursor = conn.execute(f"UPDATE {t[0]} SET ip = ? WHERE instance_id = ?", (real_ip, inst_id))
-                        # 2. 如果表里压根没存这台机器，直接顺手帮它插一条真实完整的新数据！
                         if cursor.rowcount == 0 and t[0] in ["servers", "ecs_instances", "ecs_business", "instances", "launch_templates"]:
                             try:
                                 conn.execute(f"INSERT INTO {t[0]} (instance_id, ip, region_id) VALUES (?, ?, ?)", (inst_id, real_ip, region_id))
@@ -367,12 +576,10 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
         except Exception as e: pass
         # ----------------------------------------------------------------------------------------
 
-        # # 1. 提取实例 ID 并构造一键直达“节点配置第二步”的悬浮内联按钮
         node_config_btn = types.InlineKeyboardMarkup(inline_keyboard=[
             [types.InlineKeyboardButton(text="⚙️ 节点配置 (选脚本)", callback_data=f"srv_sel:{inst_id}")]
         ])
 
-        # # 2. 组装文案
         text = (
             f"🎉 **MG 控制台扩容成功！**\n\n"
             f"🌏 **地域**: `{region_id}`\n"
@@ -381,13 +588,11 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
             f"✅ **状态**: 运行中\n\n"
             f"安全组与计费模式已按模板自动下发。 "
         )
-        # # 3. 将悬浮按钮直接挂载到最终成功提示的消息底部！
         await progress_msg.edit_text(text, parse_mode="Markdown", reply_markup=node_config_btn)
     else:
         await progress_msg.edit_text(f"❌ **创建失败**\n\n原因: {result.get('error')}", parse_mode="Markdown")
         
     await callback.answer()
-
 
 def get_single_instance_sync(instance_id: str) -> dict:
     """调用阿里云 API 获取单台机器的最新物理状态"""

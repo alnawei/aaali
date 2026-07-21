@@ -7,6 +7,8 @@ import asyncio
 import paramiko
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
 
 # ================= 1. 定义添加服务器的 FSM 状态机 =================
 class MguiAddServerFSM(StatesGroup):
@@ -78,38 +80,105 @@ def get_servers_data(user_id: int):
 
 def build_servers_keyboard(user_id: int):
     """
-    ⚡️ 智能状态灯版键盘菜单：
-    自动获取并展示服务器的实时运行状态（🟢 运行中 / 🔴 已停用 / 🔵 开机中）
+    ⚡️ 智能状态灯版键盘菜单 (已升级为多账号双列矩阵排版)：
+    自动获取并按账号分组展示服务器，采用 2 个一行的高效排版。
     """
     servers = get_servers_data(user_id)
-    builder = []
     
-    # 1. 遍历并展示所有在管机器（阿里云机器 + 自定义机器）
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from aiogram.types import InlineKeyboardButton
+    builder = InlineKeyboardBuilder()
+    
+    # 🌟 优化1：地域简称映射字典（解决按钮文字被截断的问题）
+    REGION_SHORT = {
+        "cn-hongkong": "HK", "hongkong": "HK",
+        "ap-northeast-1": "JP", "tokyo": "JP",
+        "ap-northeast-2": "KR", "seoul": "KR",
+        "ap-southeast-1": "SG", "singapore": "SG",
+        "us-west-1": "US", "us-east-1": "US",
+        "eu-central-1": "DE", "frankfurt": "DE"
+    }
+    
+    grouped_accounts = {}
+    ssh_nodes = []
+    
     for srv in servers:
-        inst_id = srv.get("instance_id", "")
-        ip_display = srv.get("ip", "0.0.0.0")
+        inst_id = str(srv.get("instance_id", ""))
+        region_raw = srv.get("region_id", srv.get("region", ""))
         
-        status_raw = str(srv.get("status", srv.get("state", "Running"))).lower()
-        
-        if "running" in status_raw or "运行" in status_raw or "正常" in status_raw or status_raw == "1":
-            status_icon = "🟢"
-        elif "stopped" in status_raw or "停" in status_raw or "关" in status_raw or status_raw == "0":
-            status_icon = "🔴"
-        else:
-            status_icon = "🔵"
-        
-        if ip_display == "0.0.0.0" or not ip_display:
-            ip_display = "阿里云分配IP中..."
-            status_icon = "🔵"
+        # 🌟 优化2：最精准的分类判断！
+        # 如果带有密码字段，或者实例ID不是阿里云标志性的 'i-' 开头，或者根本没地域，统统归为 SSH！
+        if "root_password" in srv or not inst_id.startswith("i-") or not region_raw:
+            ssh_nodes.append(srv)
+            continue
             
-        cb_data = f"srv_sel:{inst_id}"
-        button_text = f"{status_icon} IP: {ip_display}" if "分配中" not in ip_display else f"{status_icon} {ip_display}"
-        builder.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
+        # 走到这里的，才是真正的阿里云机器
+        acc_id = srv.get('account_id', 1)
+        acc_name = srv.get('account_alias', f'主账号 (ID:{acc_id})' if acc_id == 1 else f'账号 {acc_id}')
+        
+        if acc_id not in grouped_accounts:
+            grouped_accounts[acc_id] = {'name': acc_name, 'nodes': []}
+        grouped_accounts[acc_id]['nodes'].append(srv)
+        
+    # ================= 2. 动态渲染阿里云机器（按账号分组） =================
+    for acc_id, acc_info in grouped_accounts.items():
+        builder.row(InlineKeyboardButton(text=f"━━━ 🏢 阿里云：{acc_info['name']} ━━━", callback_data="ignore_click"))
+        
+        row_buttons = []
+        for srv in acc_info['nodes']:
+            inst_id = srv.get("instance_id", "")
+            ip_display = srv.get("ip", "0.0.0.0")
+            
+            # 判断状态灯
+            if ip_display in ["0.0.0.0", "", "None", "IP分配中..."]:
+                ip_display = "分配中"
+                status_icon = "🔵"
+            else:
+                status_raw = str(srv.get("status", srv.get("state", "Running"))).lower()
+                if "running" in status_raw or "运行" in status_raw or "正常" in status_raw or status_raw == "1":
+                    status_icon = "🟢"
+                elif "stopped" in status_raw or "停" in status_raw or "关" in status_raw or status_raw == "0":
+                    status_icon = "🔴"
+                else:
+                    status_icon = "🔵"
+            
+            # 获取地域简称 (找不到就截取末尾的两个字母)
+            region = srv.get("region_id", srv.get("region", ""))
+            r_short = REGION_SHORT.get(region, region.split('-')[-1][:2].upper() if region else "未知")
+            
+            # 拼装精简版按钮文字 (例如: 🟢 HK | 47.83.xx.xx)
+            btn_text = f"{status_icon} {r_short} | {ip_display}"
+            
+            row_buttons.append(InlineKeyboardButton(text=btn_text, callback_data=f"srv_sel:{inst_id}"))
+            
+            if len(row_buttons) == 2:
+                builder.row(*row_buttons)
+                row_buttons = []
+                
+        if row_buttons:
+            builder.row(*row_buttons)
+
+    # ================= 3. 渲染手动添加的 SSH 机器 =================
+    if ssh_nodes:
+        builder.row(InlineKeyboardButton(text="━━━ 🔌 自定义 SSH 服务器 ━━━", callback_data="ignore_click"))
+        row_buttons = []
+        for srv in ssh_nodes:
+            inst_id = srv.get("instance_id", "")
+            ip_display = srv.get("ip", "未知IP")
+            btn_text = f"🟢 SSH | {ip_display}"
+            
+            row_buttons.append(InlineKeyboardButton(text=btn_text, callback_data=f"srv_sel:{inst_id}"))
+            
+            if len(row_buttons) == 2:
+                builder.row(*row_buttons)
+                row_buttons = []
+        if row_buttons:
+            builder.row(*row_buttons)
+            
+    # ================= 4. 底部挂载固定入口 =================
+    builder.row(InlineKeyboardButton(text="➕ 添加自定义服务器 (SSH)", callback_data="custom_srv:add"))
     
-    # 2. ⭐ 核心新增：在列表最底部永远挂载“添加自定义服务器”入口
-    builder.append([InlineKeyboardButton(text="➕ 添加自定义服务器 (SSH)", callback_data="custom_srv:add")])
-    
-    return InlineKeyboardMarkup(inline_keyboard=builder)
+    return builder.as_markup()
 
 # ================= 🚀 第一步：接收主菜单点击 =================
 @router.message(F.text == "⚙️ 节点配置")

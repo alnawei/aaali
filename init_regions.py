@@ -183,9 +183,15 @@ def init_region_for_account(account_id, alias, ak, sk, region_id):
                 image_id=IMAGE_ID,
                 instance_type=INSTANCE_TYPE,
                 instance_name=f"Node-Acc{account_id}", 
-                internet_max_bandwidth_out=5,
-                internet_charge_type="PayByTraffic",
-                instance_charge_type="PostPaid",
+                internet_max_bandwidth_out=200,      # 带宽
+                internet_charge_type="PayByTraffic", # 网络依然按流量计费（推荐，省钱）
+                
+                # 🌟 核心修改：改为包年包月
+                instance_charge_type="PrePaid",      # 实例计费方式：PrePaid (包年包月)
+                period=1,                            # 购买时长：1
+                period_unit="Month",                 # 时长单位：Month (月)
+                auto_renew=False,,                   # 自动续费：True (强烈建议开启，防止机器忘记续费被释放)
+
                 user_data=user_data_b64,
                 system_disk=system_disk_config,
                 security_group_id=sg_id,

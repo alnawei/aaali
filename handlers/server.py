@@ -47,6 +47,7 @@ GLOBAL_REGIONS = [
     "eu-west-1", "eu-west-2", "eu-west-3", "us-west-1", 
     "us-east-1", "me-east-1", "me-central-1", "na-south-1"
 ]
+
 # ==================================================
 
 # 定义 FSM 状态机
@@ -211,39 +212,14 @@ def _fetch_single_region_sync(account_id: int, region_id: str) -> list:
         return []
 
 async def get_instances_by_account_async(account_id: int) -> list:
-    """⚡️ 终极优化版：结合本地账本，实现 0 浪费精准并发查询"""
-    import sqlite3
-    import config
-    import asyncio
+    """⚡️ 纯净实时版：不查本地账本，直接高并发拉取全球数据"""
     
-    # 1. 毫秒级查库：只提取该账号真正在用的地域
-    try:
-        conn = sqlite3.connect(config.DB_PATH)
-        cursor = conn.cursor()
-        # 从对账表里，找出真有机器的地域
-        cursor.execute("""
-            SELECT DISTINCT region_id 
-            FROM account_assets 
-            WHERE account_id = ? AND (running_count > 0 OR stopped_count > 0)
-        """, (account_id,))
-        active_regions = [row[0] for row in cursor.fetchall()]
-        conn.close()
-    except Exception as e:
-        print(f"查库失败，回退到默认地域: {e}")
-        # 如果表还没建好或者报错，做个保底
-        active_regions = ["cn-hongkong", "ap-northeast-1"] 
-
-    # 🌟 极致优化：如果账本显示这个账号根本没机器，直接秒回空列表！连 API 都不调了！
-    if not active_regions:
-        return []
-        
-    # 2. 精准狙击：只向这几个真实存在的地域并发请求
-    tasks = [asyncio.to_thread(_fetch_single_region_sync, account_id, r) for r in active_regions]
+    # 🌟 直接引用文件顶部已经写好的 GLOBAL_REGIONS 全局名单！代码瞬间清爽！
+    tasks = [asyncio.to_thread(_fetch_single_region_sync, account_id, r) for r in GLOBAL_REGIONS]
     results = await asyncio.gather(*tasks)
     
     # 过滤掉空结果，摊平列表
-    all_instances = [inst for region_list in results for inst in region_list]
-    return all_instances
+    return [inst for region_list in results for inst in region_list]
 
 # ================= 2. 动态折叠菜单 UI 构建器 =================
 
@@ -341,71 +317,52 @@ ECS_MENU_CACHE = {}
 CACHE_TTL = 300  # 缓存保质期 300 秒 (5分钟)
 
 
+# ==========================================
+# 🌟 已移除所有内存缓存逻辑，每次点击强制实时查云端
+# ==========================================
+
 @router.callback_query(F.data.startswith("select_acc:"))
 async def process_account_selection(call: types.CallbackQuery, state: FSMContext):
     
-    # 🌟【核心优化 1】第一时间终结卡顿！立刻告诉 TG 停止按钮的转圈圈动画
-    await call.answer()
+    # 1. 🌟 核心优化：立刻响应 TG，告诉用户正在实时拉取
+    await call.answer("🔄 正在向云端实时拉取最新数据，请稍候...", show_alert=False)
 
-    # 1. 拆解回调数据，提取出账号 ID
+    # 2. 提取账号 ID
     account_id_str = call.data.split(":")[1]
     account_id = int(account_id_str)
     
-    # 2. 将当前选中的 account_id 存入状态机
+    # 3. 将当前选中的 account_id 存入状态机
     await state.update_data(current_account_id=account_id)
     
     try:
-        current_time = time.time()
-        cache_data = ECS_MENU_CACHE.get(account_id)
+        # 🌟 核心修改：没有任何缓存判断！直接无脑向阿里云拉取最真实的数据！
+        instances = await get_instances_by_account_async(account_id)
         
-        # 🌟【核心优化 2】判断缓存：如果 5 分钟内点过，直接从内存秒提数据！
-        if cache_data and (current_time - cache_data['timestamp'] < CACHE_TTL):
-            instances = cache_data['instances']
-            cache_tip = "⚡️(极速缓存模式)"
-        else:
-            # 缓存过期或首次点击：老老实实去阿里云查，并写入内存缓存
-            instances = await get_instances_by_account_async(account_id)
-            ECS_MENU_CACHE[account_id] = {
-                "instances": instances,
-                "timestamp": current_time
-            }
-            cache_tip = "🔄(实时最新数据)"
-        
-        # ================= 以下为你原汁原味的拼装逻辑 =================
         running_count = sum(1 for i in instances if i['status'] == 'Running')
         stopped_count = sum(1 for i in instances if i['status'] in ['Stopped', 'Stopping'])
         pending_count = sum(1 for i in instances if i['status'] in ['Pending', 'Starting'])
 
-        # 界面加上了一个小提示标，让你知道当前是秒开还是真实查询
+        # 界面去掉“极速缓存”字眼，明确告诉用户这是实时数据
         text = (
-            f"🏢 **当前账号 ECS 概览** {cache_tip}\n\n"
+            f"🏢 **当前账号 ECS 概览** 🔄(实时云端数据)\n\n"
             f"🟢 运行中: {running_count} 台\n"
             f"🔴 已停用: {stopped_count} 台\n"
             f"🔵 部署/开机中: {pending_count} 台\n"
         )
         
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
         builder = InlineKeyboardBuilder()
         
-        # 🌟【核心优化 3】新增强制同步按钮
-        builder.row(InlineKeyboardButton(text="🔄 强制同步最新数据", callback_data=f"force_sync_acc:{account_id}"))
+        # ⚠️ 注意：这里彻底删掉了“强制同步最新数据”按钮，因为现在每一次点击，本身就是最暴力的强制同步！
         builder.row(InlineKeyboardButton(text="➕ 新增服务器", callback_data="add_server"))
         
         region_map = {
-            "cn-hongkong": "HK",       
-            "ap-northeast-1": "JP",    
-            "ap-northeast-2": "KR",    
-            "ap-southeast-1": "SG",    
-            "ap-southeast-3": "MY",    
-            "ap-southeast-5": "ID",    
-            "ap-southeast-6": "PH",    
-            "ap-southeast-7": "TH",    
-            "eu-central-1": "DE",      
-            "eu-west-1": "UK",         
-            "eu-west-3": "FR",         
-            "us-west-1": "US",         
-            "us-east-1": "US",         
-            "me-east-1": "AE",         
-            "me-central-1": "SA"       
+            "cn-hongkong": "HK", "ap-northeast-1": "JP", "ap-northeast-2": "KR",    
+            "ap-southeast-1": "SG", "ap-southeast-3": "MY", "ap-southeast-5": "ID",    
+            "ap-southeast-6": "PH", "ap-southeast-7": "TH", "eu-central-1": "DE",      
+            "eu-west-1": "UK", "eu-west-3": "FR", "us-west-1": "US",         
+            "us-east-1": "US", "me-east-1": "AE", "me-central-1": "SA"       
         }
 
         for inst in instances:
@@ -609,80 +566,80 @@ async def process_credentials_input(message: types.Message, state: FSMContext):
 
     
 # =====================================================================
-# ================= 🚀 新增服务器 (邮箱验证 + 调用启动模板) =================
+# ================= 🚀 新增服务器 (已关闭邮箱验证版) =================
 # =====================================================================
 
 @router.callback_query(F.data == "add_server")
 async def trigger_add_server(callback: types.CallbackQuery, state: FSMContext):
-    """处理【新增服务器】点击事件"""
-    # 1. 保留你的最高权限拦截
+    """处理【新增服务器】点击事件（直达选地域）"""
+    # 1. 权限拦截
     if callback.from_user.id != config.ADMIN_ID: 
         return await callback.answer("权限不足！", show_alert=True)
 
-    # 2. 🌟 核心新增：确保当前 FSM 记忆里有刚选中的账号 ID
+    # 2. 确保当前 FSM 记忆里有刚选中的账号 ID
     user_data = await state.get_data()
     account_id = user_data.get("current_account_id")
     if not account_id:
         return await callback.answer("⚠️ 会话已过期，请退回主菜单重新选择账号", show_alert=True)
 
-    # 3. 完美继承你的发信逻辑
-    verify_code = f"{random.randint(0, 999999):06d}"
-    await callback.message.answer("⏳ 正在向绑定邮箱发送验证码，请稍候...")
-    send_success = await send_email_async(verify_code)
-
-    if send_success:
-        # 💡 这里非常关键：update_data 是追加数据，它会把 code 塞进去，
-        # 同时完美保留我们上一环存进去的 current_account_id！
-        await state.update_data(code=verify_code, timestamp=time.time())
-        await state.set_state(ServerManagement.waiting_for_code)
-        await callback.message.answer("✅ 验证码已发送至绑定邮箱！\n请直接在此回复 `6位数字验证码`。")
-    else:
-        await callback.message.answer("❌ 验证码发送失败，请检查 SMTP 或网络配置。")
+    # 3. 检查是否有可用模板
+    import db
+    templates = db.get_all_templates()
+    if not templates:
+        await state.clear()
+        return await callback.message.answer("⚠️ 当前没有任何配置好的云端启动模板，请先在系统设置中一键开荒后再试。")
         
+    # 4. 直接跳过验证码，进入等待选地域阶段！
+    await state.set_state(ServerManagement.waiting_for_region)
+    await callback.message.answer(
+        "🚀 已跳过安全验证。\n请选择您要部署新 ECS 服务器的目标地域：", 
+        reply_markup=get_region_main_menu()
+    )
+    
     await callback.answer()
 
-@router.message(ServerManagement.waiting_for_code)
-async def verify_add_server_code(message: types.Message, state: FSMContext):
-    """处理用户输入的验证码，并展示云端启动模板"""
-    if message.from_user.id != config.ADMIN_ID: return
+# @router.message(ServerManagement.waiting_for_code)
+# async def verify_add_server_code(message: types.Message, state: FSMContext):
+#     """处理用户输入的验证码，并展示云端启动模板"""
+#     if message.from_user.id != config.ADMIN_ID: return
     
-    user_input_code = message.text.strip()
+#     user_input_code = message.text.strip()
     
-    # ==============================================================
-    # 🌟 修复漏洞三：新增退出机制，防止 FSM 死锁
-    # ==============================================================
-    if user_input_code.lower() == "/cancel":
-        await state.clear()
-        await message.answer("✅ 已取消新增服务器操作，您可以继续使用其他功能。")
-        return
-    # ==============================================================
+#     # ==============================================================
+#     # 🌟 修复漏洞三：新增退出机制，防止 FSM 死锁
+#     # ==============================================================
+#     if user_input_code.lower() == "/cancel":
+#         await state.clear()
+#         await message.answer("✅ 已取消新增服务器操作，您可以继续使用其他功能。")
+#         return
+#     # ==============================================================
 
-    user_data = await state.get_data()
+#     user_data = await state.get_data()
     
-    if time.time() - user_data.get("timestamp", 0) > 300:
-        await state.clear()
-        return await message.answer("⚠️ 验证码已过期，请重新进入【💻 服务器管理】点击新增。")
+#     if time.time() - user_data.get("timestamp", 0) > 300:
+#         await state.clear()
+#         return await message.answer("⚠️ 验证码已过期，请重新进入【💻 服务器管理】点击新增。")
 
-    if user_input_code == user_data.get("code"):
-        # ⚠️ 删除了 await state.clear()，以保护 current_account_id 往下传递
+#     if user_input_code == user_data.get("code"):
+#         # ⚠️ 删除了 await state.clear()，以保护 current_account_id 往下传递
         
-        # 接入数据库模板逻辑
-        import db
-        templates = db.get_all_templates()
+#         # 接入数据库模板逻辑
+#         import db
+#         templates = db.get_all_templates()
         
-        if not templates:
-            # 如果没有模板，说明业务跑不下去，这时候再 clear 并拦截
-            await state.clear()
-            return await message.answer("⚠️ 当前没有任何配置好的云端启动模板，请先在控制台或数据库中添加后再试。")
+#         if not templates:
+#             # 如果没有模板，说明业务跑不下去，这时候再 clear 并拦截
+#             await state.clear()
+#             return await message.answer("⚠️ 当前没有任何配置好的云端启动模板，请先在控制台或数据库中添加后再试。")
             
-        # 状态机完美转移：账号 ID 被安全保留，同时进入等待选地域阶段
-        await state.set_state(ServerManagement.waiting_for_region)
-        await message.answer(
-            "✅ 验证码核对无误！\n请选择您要部署新ECS服务器的目标地域：", 
-            reply_markup=get_region_main_menu()
-        )
-    else:
-        await message.answer("❌ 验证码错误，请核对邮箱后重新输入 6 位数字 (或回复 /cancel 取消)：")
+#         # 状态机完美转移：账号 ID 被安全保留，同时进入等待选地域阶段
+#         await state.set_state(ServerManagement.waiting_for_region)
+#         await message.answer(
+#             "✅ 验证码核对无误！\n请选择您要部署新ECS服务器的目标地域：", 
+#             reply_markup=get_region_main_menu()
+#         )
+#     else:
+#         await message.answer("❌ 验证码错误，请核对邮箱后重新输入 6 位数字 (或回复 /cancel 取消)：")
 
 @router.callback_query(ServerManagement.waiting_for_region, F.data.startswith("menu_"))
 async def navigate_menus(callback: types.CallbackQuery):
@@ -707,7 +664,6 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
     """接收最终的地区选择，调用阿里云 API 自动化开机"""
     if callback.from_user.id != config.ADMIN_ID: return await callback.answer()
     
-    # 🌟 1. 核心新增：提取我们在第一步存下的 account_id
     user_data = await state.get_data()
     account_id = user_data.get("current_account_id")
     
@@ -716,14 +672,28 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
         return await callback.message.edit_text("⚠️ 账号上下文已丢失，请返回主菜单重新选择云账号。")
     
     region_id = callback.data.replace("region_", "")
-    template_id = get_template_id(account_id, region_id)
     
-    if not template_id:
-        return await callback.message.edit_text(f"⚠️ 暂未在系统或 `.env` 中配置 `{region_id}` 对应的启动模板，请配置后重试。")
+    # ==========================================
+    # 🌟 找回丢失的防呆补丁：完美拦截模板缺失报错
+    # ==========================================
+    try:
+        template_id = get_template_id(account_id, region_id)
+    except ValueError as e:
+        # 如果抛出了模板找不到的错误，直接在屏幕上弹出一个强提醒！
+        # 并且不清理状态机，让你可以继续停留在当前页面选别的地域
+        return await callback.answer(str(e), show_alert=True)
+    except Exception as e:
+        return await callback.message.edit_text(f"❌ 读取模板失败: {e}")
         
-    # 拿到账号并验证通过后，安全清理状态机
+    if not template_id:
+        return await callback.message.edit_text(f"⚠️ 暂未在系统中配置 `{region_id}` 对应的启动模板，请配置后重试。")
+    # ==========================================
+        
+    # 拿到账号、拿到模板，验证一切通过后，安全清理状态机
     await state.clear()
-    progress_msg = await callback.message.edit_text(f"🚀 已拦截指令。正在向目标云账号的 `{region_id}` 下发创建任务，请耐心等待 (约需20-40秒)...")
+    progress_msg = await callback.message.edit_text(f"🚀 已跳过安全验证。正在向目标云账号的 `{region_id}` 下发创建任务，请耐心等待 (约需20-40秒)...")
+    
+    # ... 下方保留你原有的开机逻辑与 _sync_dbs，千万别删 ...
     
     # 🌟 2. 核心改变：把 account_id 作为第一个参数，传给底层的开机函数
     result = await asyncio.to_thread(create_ecs_instance_sync, account_id, region_id, template_id)
@@ -733,29 +703,41 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
         real_ip = result.get('ip', '0.0.0.0')
 
         # ==========================================
-        # 🌟 修复阻塞漏洞：封装同步扫库与写入逻辑
+        # 🌟 修复入库断层：直接精准写入 ecs_business 表
         # ==========================================
         def _sync_dbs(ip, i_id, r_id):
-            import sqlite3, glob
+            
+            # 🌟 智能计算今天的日期作为默认账单重置日（最大不超过 28 号）
+            current_day = min(datetime.now().day, 28)
+            
             try:
-                for db_file in glob.glob('/srv/aali/*.db'):
-                    conn = sqlite3.connect(db_file, timeout=2.0)
-                    for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
-                        try:
-                            cursor = conn.execute(f"UPDATE {t[0]} SET ip = ? WHERE instance_id = ?", (ip, i_id))
-                            # 如果没更新到任何行，且是关键表，则强行插入
-                            if cursor.rowcount == 0 and t[0] in ["servers", "ecs_instances", "ecs_business", "instances", "launch_templates"]:
-                                try:
-                                    conn.execute(f"INSERT INTO {t[0]} (instance_id, ip, region_id) VALUES (?, ?, ?)", (i_id, ip, r_id))
-                                except Exception: pass
-                            conn.commit()
-                        except Exception: pass
-                    conn.close()
+                conn = sqlite3.connect(config.DB_PATH, timeout=5.0)
+                cursor = conn.cursor()
+                
+                # 🌟 强制将 reset_day 写入数据库，覆盖建表时的默认值 1
+                cursor.execute("""
+                    INSERT INTO ecs_business (instance_id, account_id, region_id, ip, name, reset_day) 
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(instance_id) DO UPDATE SET ip=excluded.ip
+                """, (i_id, account_id, r_id, ip, f"实例-{i_id[-4:]}", current_day))
+                
+                # 资产总表的计数
+                cursor.execute("""
+                    INSERT INTO account_assets (account_id, region_id, running_count, stopped_count)
+                    VALUES (?, ?, 1, 0)
+                    ON CONFLICT(account_id, region_id) 
+                    DO UPDATE SET running_count = running_count + 1
+                """, (account_id, r_id))
+                
+                conn.commit()
+                conn.close()
+                print(f"✅ [开机同步] 实例 {i_id} (IP: {ip}, 账单日: {current_day}号) 已录入账本！")
             except Exception as e: 
-                print(f"后台同步数据库失败: {e}")
+                print(f"❌ [开机同步失败] 数据库写入异常: {e}")
 
-        # 🚀 核武器发射：把上面的耗时任务丢到 asyncio 内部维护的线程池去跑！彻底解放主线程！
+        # 发射到后台执行，绝不卡顿主线程
         await asyncio.to_thread(_sync_dbs, real_ip, inst_id, region_id)
+        # ==========================================
         
         # 🌟 这里顺手把我们刚才聊的“账本自愈 (清理缓存)”逻辑也补上
         if account_id in ECS_MENU_CACHE:

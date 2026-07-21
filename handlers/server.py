@@ -15,6 +15,7 @@ from handlers.common import get_dynamic_ecs_client
 
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from alibabacloud_cms20190101.client import Client as CmsClient
+from alibabacloud_ecs20140526 import models as ecs_models
 from alibabacloud_cms20190101 import models as cms_models
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
@@ -30,6 +31,23 @@ from alibabacloud_ecs20140526 import models as ecs_models
 
 # 实例化当前模块的路由器
 router = Router()
+
+# ================= 新增：🛡️ 全局最高权限拦截 =================
+# 只要发消息或点击按钮的人不是 ADMIN_ID，这个 router 里的所有函数都不会被触发，直接无视！
+router.message.filter(F.from_user.id == config.ADMIN_ID)
+router.callback_query.filter(F.from_user.id == config.ADMIN_ID)
+# =========================================================
+
+# ================= 全局地域大名单 =================
+# 涵盖了你菜单中支持的所有亚洲、欧美、中东等 16 个地区
+GLOBAL_REGIONS = [
+    "cn-hongkong", "ap-northeast-1", "ap-northeast-2", 
+    "ap-southeast-1", "ap-southeast-3", "ap-southeast-5", 
+    "ap-southeast-6", "ap-southeast-7", "eu-central-1", 
+    "eu-west-1", "eu-west-2", "eu-west-3", "us-west-1", 
+    "us-east-1", "me-east-1", "me-central-1", "na-south-1"
+]
+# ==================================================
 
 # 定义 FSM 状态机
 class ServerManagement(StatesGroup):
@@ -168,12 +186,10 @@ def create_ecs_instance_sync(account_id: int, region_id: str, template_id: str) 
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def get_instances_by_account(account_id: int, region_id: str = "cn-hongkong") -> list:
-    """调用阿里云 API，动态获取指定账号下的 ECS 服务器列表"""
+def _fetch_single_region_sync(account_id: int, region_id: str) -> list:
+    """内部同步函数：只负责去单个地域拿数据"""
     try:
-        # ⭐ 核心改变：直接调用动态工厂，传入账号 ID，实时生成专属 Client
         client = get_dynamic_ecs_client(account_id, region_id)
-        
         req = ecs_models.DescribeInstancesRequest(region_id=region_id, page_size=50)
         resp = client.describe_instances(req)
         
@@ -186,12 +202,48 @@ def get_instances_by_account(account_id: int, region_id: str = "cn-hongkong") ->
                 instances.append({
                     "id": inst.instance_id,
                     "ip": ip,
-                    "status": inst.status
+                    "status": inst.status,
+                    "region": region_id
                 })
         return instances
     except Exception as e:
         print(f"❌ 获取实例列表失败 (Account ID: {account_id}, Region: {region_id}): {e}")
         return []
+
+async def get_instances_by_account_async(account_id: int) -> list:
+    """⚡️ 终极优化版：结合本地账本，实现 0 浪费精准并发查询"""
+    import sqlite3
+    import config
+    import asyncio
+    
+    # 1. 毫秒级查库：只提取该账号真正在用的地域
+    try:
+        conn = sqlite3.connect(config.DB_PATH)
+        cursor = conn.cursor()
+        # 从对账表里，找出真有机器的地域
+        cursor.execute("""
+            SELECT DISTINCT region_id 
+            FROM account_assets 
+            WHERE account_id = ? AND (running_count > 0 OR stopped_count > 0)
+        """, (account_id,))
+        active_regions = [row[0] for row in cursor.fetchall()]
+        conn.close()
+    except Exception as e:
+        print(f"查库失败，回退到默认地域: {e}")
+        # 如果表还没建好或者报错，做个保底
+        active_regions = ["cn-hongkong", "ap-northeast-1"] 
+
+    # 🌟 极致优化：如果账本显示这个账号根本没机器，直接秒回空列表！连 API 都不调了！
+    if not active_regions:
+        return []
+        
+    # 2. 精准狙击：只向这几个真实存在的地域并发请求
+    tasks = [asyncio.to_thread(_fetch_single_region_sync, account_id, r) for r in active_regions]
+    results = await asyncio.gather(*tasks)
+    
+    # 过滤掉空结果，摊平列表
+    all_instances = [inst for region_list in results for inst in region_list]
+    return all_instances
 
 # ================= 2. 动态折叠菜单 UI 构建器 =================
 
@@ -282,38 +334,80 @@ async def cmd_server_management(message: types.Message, state: FSMContext):
     )
 
 
+# ==========================================
+# 🌟 新增：全局内存缓存字典与过期时间
+# ==========================================
+ECS_MENU_CACHE = {}
+CACHE_TTL = 300  # 缓存保质期 300 秒 (5分钟)
+
+
 @router.callback_query(F.data.startswith("select_acc:"))
 async def process_account_selection(call: types.CallbackQuery, state: FSMContext):
+    
+    # 🌟【核心优化 1】第一时间终结卡顿！立刻告诉 TG 停止按钮的转圈圈动画
+    await call.answer()
 
     # 1. 拆解回调数据，提取出账号 ID
     account_id_str = call.data.split(":")[1]
-    
-    # 将字符串类型的 ID 转换为整数
     account_id = int(account_id_str)
     
-    # 2. 将当前选中的 account_id 存入状态机 (FSM)
+    # 2. 将当前选中的 account_id 存入状态机
     await state.update_data(current_account_id=account_id)
     
     try:
-        # =====================================================================
-        # ⚠️ 注意：这里调用的是改造后的、支持多账号的查询函数
-        # =====================================================================
-        instances = await asyncio.to_thread(get_instances_by_account, account_id)
+        current_time = time.time()
+        cache_data = ECS_MENU_CACHE.get(account_id)
         
+        # 🌟【核心优化 2】判断缓存：如果 5 分钟内点过，直接从内存秒提数据！
+        if cache_data and (current_time - cache_data['timestamp'] < CACHE_TTL):
+            instances = cache_data['instances']
+            cache_tip = "⚡️(极速缓存模式)"
+        else:
+            # 缓存过期或首次点击：老老实实去阿里云查，并写入内存缓存
+            instances = await get_instances_by_account_async(account_id)
+            ECS_MENU_CACHE[account_id] = {
+                "instances": instances,
+                "timestamp": current_time
+            }
+            cache_tip = "🔄(实时最新数据)"
+        
+        # ================= 以下为你原汁原味的拼装逻辑 =================
         running_count = sum(1 for i in instances if i['status'] == 'Running')
         stopped_count = sum(1 for i in instances if i['status'] in ['Stopped', 'Stopping'])
         pending_count = sum(1 for i in instances if i['status'] in ['Pending', 'Starting'])
 
+        # 界面加上了一个小提示标，让你知道当前是秒开还是真实查询
         text = (
-            f"🏢 **当前账号 ECS 概览**\n\n"
+            f"🏢 **当前账号 ECS 概览** {cache_tip}\n\n"
             f"🟢 运行中: {running_count} 台\n"
             f"🔴 已停用: {stopped_count} 台\n"
             f"🔵 部署/开机中: {pending_count} 台\n"
         )
         
         builder = InlineKeyboardBuilder()
+        
+        # 🌟【核心优化 3】新增强制同步按钮
+        builder.row(InlineKeyboardButton(text="🔄 强制同步最新数据", callback_data=f"force_sync_acc:{account_id}"))
         builder.row(InlineKeyboardButton(text="➕ 新增服务器", callback_data="add_server"))
         
+        region_map = {
+            "cn-hongkong": "HK",       
+            "ap-northeast-1": "JP",    
+            "ap-northeast-2": "KR",    
+            "ap-southeast-1": "SG",    
+            "ap-southeast-3": "MY",    
+            "ap-southeast-5": "ID",    
+            "ap-southeast-6": "PH",    
+            "ap-southeast-7": "TH",    
+            "eu-central-1": "DE",      
+            "eu-west-1": "UK",         
+            "eu-west-3": "FR",         
+            "us-west-1": "US",         
+            "us-east-1": "US",         
+            "me-east-1": "AE",         
+            "me-central-1": "SA"       
+        }
+
         for inst in instances:
             if inst['status'] == 'Running':
                 status_emoji = "🟢"
@@ -322,8 +416,9 @@ async def process_account_selection(call: types.CallbackQuery, state: FSMContext
             else:
                 status_emoji = "🔵"
                 
-            btn_text = f"{status_emoji} IP: {inst['ip']}"
-            btn_data = f"srv_sel:{inst['id']}"
+            short_region = region_map.get(inst['region'], inst['region'])
+            btn_text = f"{status_emoji} [{short_region}] IP: {inst['ip']}"
+            btn_data = f"manage_ecs_{inst['id']}" 
             builder.row(InlineKeyboardButton(text=btn_text, callback_data=btn_data))
             
         builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="back_to_accounts"))
@@ -333,6 +428,75 @@ async def process_account_selection(call: types.CallbackQuery, state: FSMContext
     except Exception as e:
         await call.message.edit_text(f"❌ 获取服务器列表失败：{str(e)}\n请检查该账号的 API 密钥配置。")
 
+# ================= 强制同步最新数据 =================
+@router.callback_query(F.data.startswith("force_sync_acc:"))
+async def process_force_sync(call: types.CallbackQuery, state: FSMContext):
+    # 1. 立刻响应 TG，告诉用户正在拉取
+    await call.answer("🔄 正在强制绕过缓存，向阿里云请求最新数据...", show_alert=False)
+    
+    # 2. 提取账号 ID
+    account_id = int(call.data.split(":")[1])
+    
+    try:
+        import time
+        # 3. 🌟 核心动作：直接强制调用最新的高并发函数去阿里云拉数据 (绝对不读本地缓存)
+        instances = await get_instances_by_account_async(account_id)
+        
+        # 4. 拿到最新鲜的数据后，强制覆盖写入本地内存字典
+        current_time = time.time()
+        ECS_MENU_CACHE[account_id] = {
+            "instances": instances,
+            "timestamp": current_time
+        }
+        
+        # ================= 下面是原汁原味的重新渲染面板逻辑 =================
+        running_count = sum(1 for i in instances if i['status'] == 'Running')
+        stopped_count = sum(1 for i in instances if i['status'] in ['Stopped', 'Stopping'])
+        pending_count = sum(1 for i in instances if i['status'] in ['Pending', 'Starting'])
+
+        text = (
+            f"🏢 **当前账号 ECS 概览** ⚡️(已强制刷新至最新状态)\n\n"
+            f"🟢 运行中: {running_count} 台\n"
+            f"🔴 已停用: {stopped_count} 台\n"
+            f"🔵 部署/开机中: {pending_count} 台\n"
+        )
+        
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
+        builder = InlineKeyboardBuilder()
+        
+        # 依然保留强制同步按钮
+        builder.row(InlineKeyboardButton(text="🔄 强制同步最新数据", callback_data=f"force_sync_acc:{account_id}"))
+        builder.row(InlineKeyboardButton(text="➕ 新增服务器", callback_data="add_server"))
+        
+        region_map = {
+            "cn-hongkong": "HK", "ap-northeast-1": "JP", "ap-northeast-2": "KR",    
+            "ap-southeast-1": "SG", "ap-southeast-3": "MY", "ap-southeast-5": "ID",    
+            "ap-southeast-6": "PH", "ap-southeast-7": "TH", "eu-central-1": "DE",      
+            "eu-west-1": "UK", "eu-west-3": "FR", "us-west-1": "US",         
+            "us-east-1": "US", "me-east-1": "AE", "me-central-1": "SA"       
+        }
+
+        for inst in instances:
+            if inst['status'] == 'Running':
+                status_emoji = "🟢"
+            elif inst['status'] in ['Stopped', 'Stopping']:
+                status_emoji = "🔴"
+            else:
+                status_emoji = "🔵"
+                
+            short_region = region_map.get(inst['region'], inst['region'])
+            btn_text = f"{status_emoji} [{short_region}] IP: {inst['ip']}"
+            btn_data = f"manage_ecs_{inst['id']}" 
+            builder.row(InlineKeyboardButton(text=btn_text, callback_data=btn_data))
+            
+        builder.row(InlineKeyboardButton(text="🔙 返回上级", callback_data="back_to_accounts"))
+        
+        # 用最新拿到的数据，替换掉旧面板
+        await call.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        
+    except Exception as e:
+        await call.message.edit_text(f"❌ 强制同步失败：{str(e)}\n可能是阿里云 API 遭遇限流或网络波动。")
 # ================= 菜单导航联动拦截器 =================
 
 # 1. 🔙 返回上级 (从二级机器列表回到一级账号列表)
@@ -483,6 +647,16 @@ async def verify_add_server_code(message: types.Message, state: FSMContext):
     if message.from_user.id != config.ADMIN_ID: return
     
     user_input_code = message.text.strip()
+    
+    # ==============================================================
+    # 🌟 修复漏洞三：新增退出机制，防止 FSM 死锁
+    # ==============================================================
+    if user_input_code.lower() == "/cancel":
+        await state.clear()
+        await message.answer("✅ 已取消新增服务器操作，您可以继续使用其他功能。")
+        return
+    # ==============================================================
+
     user_data = await state.get_data()
     
     if time.time() - user_data.get("timestamp", 0) > 300:
@@ -508,7 +682,7 @@ async def verify_add_server_code(message: types.Message, state: FSMContext):
             reply_markup=get_region_main_menu()
         )
     else:
-        await message.answer("❌ 验证码错误，请核对邮箱后重新输入 6 位数字：")
+        await message.answer("❌ 验证码错误，请核对邮箱后重新输入 6 位数字 (或回复 /cancel 取消)：")
 
 @router.callback_query(ServerManagement.waiting_for_region, F.data.startswith("menu_"))
 async def navigate_menus(callback: types.CallbackQuery):
@@ -558,23 +732,36 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
         inst_id = result['instance_id']
         real_ip = result.get('ip', '0.0.0.0')
 
-        # --- ⭐ 核心补救：无论底层有没有存库，马上用 SQL 把真正的 IP 和实例强行写入所有数据库表！ ---
-        try:
+        # ==========================================
+        # 🌟 修复阻塞漏洞：封装同步扫库与写入逻辑
+        # ==========================================
+        def _sync_dbs(ip, i_id, r_id):
             import sqlite3, glob
-            for db_file in glob.glob('/srv/aali/*.db'):
-                conn = sqlite3.connect(db_file, timeout=2.0)
-                for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
-                    try:
-                        cursor = conn.execute(f"UPDATE {t[0]} SET ip = ? WHERE instance_id = ?", (real_ip, inst_id))
-                        if cursor.rowcount == 0 and t[0] in ["servers", "ecs_instances", "ecs_business", "instances", "launch_templates"]:
-                            try:
-                                conn.execute(f"INSERT INTO {t[0]} (instance_id, ip, region_id) VALUES (?, ?, ?)", (inst_id, real_ip, region_id))
-                            except Exception: pass
-                        conn.commit()
-                    except Exception: pass
-                conn.close()
-        except Exception as e: pass
-        # ----------------------------------------------------------------------------------------
+            try:
+                for db_file in glob.glob('/srv/aali/*.db'):
+                    conn = sqlite3.connect(db_file, timeout=2.0)
+                    for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+                        try:
+                            cursor = conn.execute(f"UPDATE {t[0]} SET ip = ? WHERE instance_id = ?", (ip, i_id))
+                            # 如果没更新到任何行，且是关键表，则强行插入
+                            if cursor.rowcount == 0 and t[0] in ["servers", "ecs_instances", "ecs_business", "instances", "launch_templates"]:
+                                try:
+                                    conn.execute(f"INSERT INTO {t[0]} (instance_id, ip, region_id) VALUES (?, ?, ?)", (i_id, ip, r_id))
+                                except Exception: pass
+                            conn.commit()
+                        except Exception: pass
+                    conn.close()
+            except Exception as e: 
+                print(f"后台同步数据库失败: {e}")
+
+        # 🚀 核武器发射：把上面的耗时任务丢到 asyncio 内部维护的线程池去跑！彻底解放主线程！
+        await asyncio.to_thread(_sync_dbs, real_ip, inst_id, region_id)
+        
+        # 🌟 这里顺手把我们刚才聊的“账本自愈 (清理缓存)”逻辑也补上
+        if account_id in ECS_MENU_CACHE:
+            del ECS_MENU_CACHE[account_id]
+            print(f"♻️ [自愈] 账号 {account_id} 已新增机器，缓存已清除")
+        # ==========================================
 
         node_config_btn = types.InlineKeyboardMarkup(inline_keyboard=[
             [types.InlineKeyboardButton(text="⚙️ 节点配置 (选脚本)", callback_data=f"srv_sel:{inst_id}")]
@@ -595,34 +782,45 @@ async def execute_run_instances(callback: types.CallbackQuery, state: FSMContext
     await callback.answer()
 
 def get_single_instance_sync(instance_id: str) -> dict:
-    """调用阿里云 API 获取单台机器的最新物理状态"""
-    region_id = "cn-hongkong"
-    try:
-        ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint=f'ecs.{region_id}.aliyuncs.com'
-        )
-        client = EcsClient(ali_config)
-        req = ecs_models.DescribeInstancesRequest(
-            region_id=region_id, 
-            instance_ids=json.dumps([instance_id])
-        )
-        resp = client.describe_instances(req)
-        
-        if resp.body.instances and resp.body.instances.instance:
-            inst = resp.body.instances.instance[0]
-            ip = inst.public_ip_address.ip_address[0] if inst.public_ip_address.ip_address else "无公网IP"
-            creation_time = inst.creation_time.split('T')[0] if inst.creation_time else "未知"
-            return {
-                "id": inst.instance_id,
-                "ip": ip,
-                "status": inst.status,
-                "region": region_id,
-                "creation_time": creation_time
-            }
-    except Exception as e:
-        print(f"查询单台实例失败: {e}")
+    """调用阿里云 API 获取单台机器的最新物理状态 (全自动追踪多账号、多地域)"""   
+    # 1. 取出数据库中所有启用的云账号
+    conn = sqlite3.connect(config.DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM cloud_accounts WHERE is_active = 1")
+    accounts = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    # 2. 覆盖全球主流地域
+    regions = GLOBAL_REGIONS
+    
+    # 3. 嵌套轮询：先遍历账号，再遍历地域
+    for acc_id in accounts:
+        for region_id in regions:
+            try:
+                # 🌟 核心：使用该账号专属的动态客户端！抛弃旧死密钥！
+                client = get_dynamic_ecs_client(acc_id, region_id)
+                req = ecs_models.DescribeInstancesRequest(
+                    region_id=region_id, 
+                    instance_ids=json.dumps([instance_id])
+                )
+                resp = client.describe_instances(req)
+                
+                if resp.body.instances and resp.body.instances.instance:
+                    inst = resp.body.instances.instance[0]
+                    ip = inst.public_ip_address.ip_address[0] if inst.public_ip_address.ip_address else "无公网IP"
+                    creation_time = inst.creation_time.split('T')[0] if inst.creation_time else "未知"
+                    return {
+                        "id": inst.instance_id,
+                        "ip": ip,
+                        "status": inst.status,
+                        "region": region_id,
+                        "account_id": acc_id,  # 🌟 关键补丁：把这台机器属于哪个账号也返回去！
+                        "creation_time": creation_time
+                    }
+            except Exception:
+                continue # 这个账号或地域不对，找下一个
+                
+    print(f"查询单台实例失败: 在所有账号和地域中均未找到 {instance_id}")
     return None
 
 
@@ -688,15 +886,34 @@ async def process_manage_ecs(callback: types.CallbackQuery):
 
     current_used_traffic = await asyncio.to_thread(get_real_traffic_gb, instance_id, start_time_str)
     
+    # 🌟 1. 自动提取这台机器的开机“日” (例如 "2026-07-21" 提取出 21)
+    try:
+        creation_day = int(ali_data['creation_time'].split('-')[2])
+    except:
+        creation_day = 1  # 提取失败的容错
+
+    # 🌟 2. 获取设定的重置日，如果没单独设定过，就【默认跟随开机日】！
+    reset_day = biz_data.get('reset_day')
+    if not reset_day:
+        reset_day = creation_day
+
+    # 🌟 3. 智能生成高端的展示文案
+    if int(reset_day) == 1:
+        reset_display = "自然月 (每月 1 号重置)"
+    elif int(reset_day) == creation_day:
+        reset_display = f"跟随开机日 (每月 {reset_day} 号重置)"
+    else:
+        reset_display = f"自定义 (每月 {reset_day} 号重置)"
+    
     text = (
         "📊 **ECS 实例详情**\n\n"
         f"🌍 地域: `{ali_data['region']}`\n"
         f"🆔 实例 ID: `{ali_data['id']}`\n"
         f"🌐 公网 IP: `{ali_data['ip']}`\n"
         f"✅ 状态: {status_str}\n"
-        f"📶 本月出网流量: `{current_used_traffic} GB` / `{biz_data['traffic_limit_gb']} GB` (阈值95%防刷断网)\n"
+        f"📶 本期出网流量: `{current_used_traffic} GB` / `{biz_data['traffic_limit_gb']} GB` (阈值95%防刷断网)\n"
         f"📅 服务器开机时间: `{ali_data['creation_time']}`\n"
-        f"⏳ 服务器重置周期: 每月 `{biz_data['reset_day']}` 号重置\n"
+        f"⏳ 流量重置周期: `{reset_display}`\n"  # 🌟 智能文案生效
         f"👤 客户业务到期: `{biz_data['expire_time']}`\n"
     )
 
@@ -779,14 +996,39 @@ async def process_set_traffic(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("set_resetday_"))
 async def process_resetday_menu(callback: types.CallbackQuery):
     instance_id = callback.data.replace("set_resetday_", "")
-    await callback.answer()
+    await callback.answer("🔄 正在加载账单配置...")  # 增加一个友好的加载提示
+    
     biz_data = db.get_business_data(instance_id)
     
+    # 🌟 1. 动态获取一下阿里云的物理数据，为了拿到开机时间
+    ali_data = await asyncio.to_thread(get_single_instance_sync, instance_id)
+    if not ali_data:
+        await callback.message.answer("❌ 无法从云端读取实例创建时间。")
+        return
+        
     start_time_str = biz_data.get('traffic_start_time') or "跟随系统开机"
     
+    # 🌟 2. 保持和主面板 100% 一致的智能判断逻辑
+    try:
+        creation_day = int(ali_data['creation_time'].split('-')[2])
+    except:
+        creation_day = 1
+
+    reset_day = biz_data.get('reset_day')
+    if not reset_day:
+        reset_day = creation_day
+
+    if int(reset_day) == 1:
+        reset_display = "自然月 (每月 1 号重置)"
+    elif int(reset_day) == creation_day:
+        reset_display = f"跟随开机日 (每月 {reset_day} 号重置)"
+    else:
+        reset_display = f"自定义 (每月 {reset_day} 号重置)"
+    
+    # 🌟 3. 渲染菜单
     text = (
         f"⏳ **账期重置与流量清零**\n\n"
-        f"📅 当前账单锚点: 每月 `{biz_data['reset_day']}` 号\n"
+        f"📅 当前账单锚点: `{reset_display}`\n"
         f"⏱️ 本期流量起点: `{start_time_str}`\n\n"
         f"💡 **客户中途流量用尽怎么处理？**\n"
         f"不要动锚点日，直接点击下方【重置当月流量】。系统会将统计起点更新为此刻，之前跑的流量瞬间清零，且下个月依然按锚点日正常循环！"
@@ -795,6 +1037,7 @@ async def process_resetday_menu(callback: types.CallbackQuery):
     builder.row(InlineKeyboardButton(text="🔄 立即重置当月流量 (清零)", callback_data=f"action_cleartf_{instance_id}"))
     builder.row(InlineKeyboardButton(text="✏️ 修改账单锚点日 (1-28)", callback_data=f"input_resetday_{instance_id}"))
     builder.row(InlineKeyboardButton(text="🔙 返回服务器详情", callback_data=f"manage_ecs_{instance_id}"))
+    
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 
@@ -850,6 +1093,90 @@ async def process_release_menu(callback: types.CallbackQuery):
     builder.row(InlineKeyboardButton(text="🔙 怂了，返回详情", callback_data=f"manage_ecs_{instance_id}"))
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
+
+# =====================================================================
+# ================= 新增：开机关机控制模块 ============================
+# =====================================================================
+
+@router.callback_query(F.data.startswith("power_stop_"))
+async def execute_power_stop(callback: types.CallbackQuery):
+    instance_id = callback.data.replace("power_stop_", "")
+    await callback.message.edit_text(f"🛑 正在向阿里云下发强制关机指令...\n🆔 `{instance_id}`")
+    
+    def _do_stop():
+        from handlers.common import get_dynamic_ecs_client
+        from alibabacloud_ecs20140526 import models as ecs_models
+        
+        # 自动定位该机器属于哪个账号、哪个地域
+        inst_info = get_single_instance_sync(instance_id)
+        if not inst_info:
+            raise Exception("无法在云端定位到该实例所属账号/地域")
+            
+        client = get_dynamic_ecs_client(inst_info['account_id'], inst_info['region'])
+        # 强制关机请求
+        req = ecs_models.StopInstanceRequest(
+            instance_id=instance_id,
+            force_stop=True  # 强制关机，类似拔电源，速度更快
+        )
+        return client.stop_instance(req)
+        
+    try:
+        await asyncio.to_thread(_do_stop)
+        
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 返回刷新服务器详情", callback_data=f"manage_ecs_{instance_id}"))
+        
+        await callback.message.edit_text(
+            f"✅ **关机指令已成功下发！**\n\n"
+            f"🆔 实例: `{instance_id}`\n"
+            f"⏳ 阿里云正在执行物理断电，约需 10~20 秒。\n"
+            f"请稍后点击下方按钮刷新状态。",
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await callback.message.edit_text(f"❌ **关机失败**\n\n原因：\n`{e}`")
+
+
+@router.callback_query(F.data.startswith("power_start_"))
+async def execute_power_start(callback: types.CallbackQuery):
+    instance_id = callback.data.replace("power_start_", "")
+    await callback.message.edit_text(f"🟢 正在向阿里云下发开机指令...\n🆔 `{instance_id}`")
+    
+    def _do_start():
+        from handlers.common import get_dynamic_ecs_client
+        from alibabacloud_ecs20140526 import models as ecs_models
+        
+        inst_info = get_single_instance_sync(instance_id)
+        if not inst_info:
+            raise Exception("无法在云端定位到该实例所属账号/地域")
+            
+        client = get_dynamic_ecs_client(inst_info['account_id'], inst_info['region'])
+        req = ecs_models.StartInstanceRequest(instance_id=instance_id)
+        return client.start_instance(req)
+        
+    try:
+        await asyncio.to_thread(_do_start)
+        
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 返回刷新服务器详情", callback_data=f"manage_ecs_{instance_id}"))
+        
+        await callback.message.edit_text(
+            f"✅ **开机指令已成功下发！**\n\n"
+            f"🆔 实例: `{instance_id}`\n"
+            f"⏳ 服务器正在启动操作系统，约需 20~40 秒后网络恢复联通。\n"
+            f"请稍后点击下方按钮刷新状态。",
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await callback.message.edit_text(f"❌ **开机失败**\n\n原因：\n`{e}`")
+
+
 # =====================================================================
 # ================= 3. 危险动作执行区：重装与释放 =====================
 # =====================================================================
@@ -857,33 +1184,97 @@ async def process_release_menu(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("action_reinstall_"))
 async def execute_reinstall(callback: types.CallbackQuery):
     instance_id = callback.data.replace("action_reinstall_", "")
-    await callback.message.edit_text("🔄 正在向阿里云下发重装指令，请稍候...\n⚠️ 注意：机器必须处于【已关机】状态才能成功！")
+    await callback.message.edit_text("🔄 正在执行自动化重装连招（检测状态 ➡️ 关机 ➡️ 重装 ➡️ 开机），请耐心等待...")
     
-    def _do_reinstall():
-        region_id = "cn-hongkong"
-        ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint=f'ecs.{region_id}.aliyuncs.com'
-        )
-        client = EcsClient(ali_config)
-        req = ecs_models.ReplaceSystemDiskRequest(
-            region_id=region_id,
-            instance_id=instance_id,
-            password="@QS00008" 
-        )
-        return client.replace_system_disk(req)
+    # --- 以下是封装的同步 API 调用函数 ---
+    def _get_ecs_client_and_info():
+        from handlers.common import get_dynamic_ecs_client
+        # 移除了错误的导入，直接使用 server.py 全局环境中的 get_single_instance_sync
+        inst_info = get_single_instance_sync(instance_id)
+        if not inst_info: raise Exception("无法在云端定位到该实例")
+        client = get_dynamic_ecs_client(inst_info['account_id'], inst_info['region'])
+        return client, inst_info['region']
+
+    def _get_instance_status(client, region):
+        from alibabacloud_ecs20140526 import models as ecs_models
+        import json
+        req = ecs_models.DescribeInstancesRequest(region_id=region, instance_ids=json.dumps([instance_id]))
+        resp = client.describe_instances(req)
+        if not resp.body.instances.instance: raise Exception("未找到该实例")
+        inst = resp.body.instances.instance[0]
+        return inst.status, inst.image_id
         
+    def _stop_instance(client):
+        from alibabacloud_ecs20140526 import models as ecs_models
+        req = ecs_models.StopInstanceRequest(instance_id=instance_id)
+        client.stop_instance(req)
+
+    def _replace_disk(client, image_id):
+        from alibabacloud_ecs20140526 import models as ecs_models
+        req = ecs_models.ReplaceSystemDiskRequest(
+            instance_id=instance_id,
+            image_id=image_id,
+            password="@QS00008"
+        )
+        client.replace_system_disk(req)
+
+    def _start_instance(client):
+        from alibabacloud_ecs20140526 import models as ecs_models
+        req = ecs_models.StartInstanceRequest(instance_id=instance_id)
+        client.start_instance(req)
+
+    # --- 以下是异步全自动编排流程 ---
     try:
-        await asyncio.to_thread(_do_reinstall)
+        # 获取客户端与当前状态
+        client, region = await asyncio.to_thread(_get_ecs_client_and_info)
+        status, image_id = await asyncio.to_thread(_get_instance_status, client, region)
+        
+        # 1. 关机逻辑
+        if status == "Running":
+            await callback.message.edit_text("🔄 检测到机器正在运行，正在下发【自动关机】指令...")
+            await asyncio.to_thread(_stop_instance, client)
+            
+            # 轮询等待关机完成 (每5秒查询一次)
+            while True:
+                await asyncio.sleep(5)
+                status, _ = await asyncio.to_thread(_get_instance_status, client, region)
+                if status == "Stopped":
+                    break
+                # 如果是 Stopping 状态则继续等
+        
+        # 2. 重装逻辑
+        await callback.message.edit_text("🔄 机器已关机，正在下发【系统重装】指令...")
+        await asyncio.to_thread(_replace_disk, client, image_id)
+        
+        # 缓冲等待几秒，确保阿里云服务端彻底受理磁盘替换
+        await asyncio.sleep(5)
+        
+        # 3. 开机逻辑
+        await callback.message.edit_text("🔄 系统盘替换成功，正在执行【自动开机】...")
+        await asyncio.to_thread(_start_instance, client)
+        
+        # 构建返回按钮
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 返回服务器详情", callback_data=f"manage_ecs_{instance_id}"))
+        
+        # 输出最终成功信息
         await callback.message.edit_text(
-            f"✅ **系统重装指令已下发！**\n\n"
+            f"✅ **全自动重装连招已完成！**\n\n"
             f"🆔 实例: `{instance_id}`\n"
             f"🔑 默认密码: `@QS00008`\n"
-            f"⏳ 阿里云大约需要 1-3 分钟完成重装，请稍后在控制台尝试重新开机。"
+            f"🚀 机器正在开机中，请等待 1-2 分钟后尝试使用 SSH 连接。",
+            reply_markup=builder.as_markup()
         )
+
     except Exception as e:
-        await callback.message.edit_text(f"❌ **重装失败**\n\n原因可能是机器未关机：\n`{e}`")
+        error_msg = str(e)
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 返回服务器详情", callback_data=f"manage_ecs_{instance_id}"))
+        await callback.message.edit_text(f"❌ **全自动重装失败**\n\n原因：\n`{error_msg}`", reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.startswith("action_release_"))
@@ -891,33 +1282,27 @@ async def execute_release(callback: types.CallbackQuery):
     instance_id = callback.data.replace("action_release_", "")
     await callback.message.edit_text("🗑️ 正在执行强制销毁程序...\n1️⃣ 尝试转换计费方式为按量付费\n2️⃣ 尝试执行物理销毁")
     
-    # 🛠️ 修正 3：将转按量付费与强制删机拆成独立的同步原子操作，使用 asyncio.sleep 代替阻塞的 time.sleep
+    # 🌟 统一前置获取：提前拿到 inst_info，不仅省去重复查询，还避免了作用域混乱
+    inst_info = await asyncio.to_thread(get_single_instance_sync, instance_id)
+    if not inst_info:
+        return await callback.message.edit_text(f"❌ **释放失败**\n\n无法在云端定位到该实例 `{instance_id}`，可能已被销毁或账本不同步。")
+
     def _do_convert():
-        region_id = "cn-hongkong"
-        ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint=f'ecs.{region_id}.aliyuncs.com'
-        )
-        client = EcsClient(ali_config)
+        # 直接使用外部拿到的 inst_info
+        client = get_dynamic_ecs_client(inst_info['account_id'], inst_info['region'])
         try:
             req_convert = ecs_models.ModifyInstanceChargeTypeRequest(
-                region_id=region_id,
+                region_id=inst_info['region'],
                 instance_ids=json.dumps([instance_id]),
                 instance_charge_type="PostPaid"
             )
             client.modify_instance_charge_type(req_convert)
-        except Exception as e:
-            print(f"计费转换提示 (可忽略): {e}")
+        except Exception:
+            pass
 
     def _do_delete():
-        region_id = "cn-hongkong"
-        ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint=f'ecs.{region_id}.aliyuncs.com'
-        )
-        client = EcsClient(ali_config)
+        # 直接使用外部拿到的 inst_info
+        client = get_dynamic_ecs_client(inst_info['account_id'], inst_info['region'])
         req_delete = ecs_models.DeleteInstanceRequest(
             instance_id=instance_id,
             force=True
@@ -925,6 +1310,7 @@ async def execute_release(callback: types.CallbackQuery):
         return client.delete_instance(req_delete)
 
     def _clean_local_db():
+        import sqlite3, db
         conn = sqlite3.connect(db.DB_PATH)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM ecs_business WHERE instance_id = ?", (instance_id,))
@@ -932,18 +1318,22 @@ async def execute_release(callback: types.CallbackQuery):
         conn.close()
 
     try:
-        # 第一步：异步放入线程池尝试转付费类型
+        # 1. 尝试转付费类型
         await asyncio.to_thread(_do_convert)
-        # 第二步：纯异步休眠 2 秒等待阿里云后台数据生效，不阻塞线程池工作线程
+        # 2. 等待阿里云后台数据生效
         await asyncio.sleep(2)
-        # 第三步：放入线程池真正执行物理销毁
+        # 3. 真正执行物理销毁
         await asyncio.to_thread(_do_delete)
-        # 第四步：清理数据库
+        # 4. 清理数据库
         await asyncio.to_thread(_clean_local_db)
+        
+        # 🌟 核心注入：销毁成功，触发账本自愈！
+        if inst_info['account_id'] in ECS_MENU_CACHE:
+            del ECS_MENU_CACHE[inst_info['account_id']]
 
         await callback.message.edit_text(f"🔥 **服务器已被永久释放！**\n\n🆔 实例: `{instance_id}`\n本地业务数据已同步清理。")
     except Exception as e:
-        await callback.message.edit_text(f"❌ **释放失败**\n\n可能存在未结清订单或 API 限制：\n`{e}`")
+        await callback.message.edit_text(f"❌ **释放失败**\n\n原因：\n`{e}`")
 
 # =====================================================================
 # ================= 4. FSM 状态机：等待与处理用户输入 =================
@@ -1028,16 +1418,14 @@ async def execute_set_bandwidth_fixed(callback: types.CallbackQuery):
     await callback.message.edit_text(f"🚀 正在向阿里云提交申请，调整带宽至 **{bw_size} Mbps**...")
     
     def _do_modify_bw():
-        region_id = "cn-hongkong"
-        ali_config = open_api_models.Config(
-            access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint=f'ecs.{region_id}.aliyuncs.com'
-        )
-        client = EcsClient(ali_config)
+        inst_info = get_single_instance_sync(instance_id)
+        if not inst_info: raise Exception("无法在云端定位到该实例")
+        
+        # 直接拿动态客户端！超级简洁！
+        client = get_dynamic_ecs_client(inst_info['account_id'], inst_info['region'])
         req = ecs_models.ModifyInstanceNetworkSpecRequest(
             instance_id=instance_id,
-            internet_max_bandwidth_out=bw_size 
+            internet_max_bandwidth_out=bw_size
         )
         return client.modify_instance_network_spec(req)
         
@@ -1145,13 +1533,10 @@ def _extend_client_time(instance_id: str) -> str:
 
 def _renew_aliyun_instance(instance_id: str):
     """向阿里云发起真实的物理机续费请求"""
-    region_id = "cn-hongkong"
-    ali_config = open_api_models.Config(
-        access_key_id=config.ALIYUN_ACCESS_KEY_ID,
-        access_key_secret=config.ALIYUN_ACCESS_KEY_SECRET,
-        endpoint=f'ecs.{region_id}.aliyuncs.com'
-    )
-    client = EcsClient(ali_config)
+    inst_info = get_single_instance_sync(instance_id)
+    if not inst_info: raise Exception("无法在云端定位到该实例")
+    
+    client = get_dynamic_ecs_client(inst_info['account_id'], inst_info['region'])
     req = ecs_models.RenewInstanceRequest(
         instance_id=instance_id,
         period=1 
